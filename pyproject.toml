@@ -6,5 +6,6 @@ readme = "README.md"
 requires-python = ">=3.10.6"
 dependencies = [
     "helion>=0.2.7",
+    "numpy>=2.2.6",
     "torch>=2.9.1",
 ]
