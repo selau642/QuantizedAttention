@@ -1,0 +1,111 @@
+import torch
+import helion
+import helion.language as hl
+
+import math
+from typing import Tuple
+
+@helion.kernel(
+    static_shapes=True
+)
+def atten_fwd_training(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Computes forward for Attention
+        Attention = Softmax(Q * K_T/SQRT(d_k)) * V
+
+    Args:
+        q: Query shape [batch, head, q_tokens, head_dim]
+        k: Key shape [batch, head, k_tokens, head_dim]
+        v: Value shape [batch, head, v_tokens, head_dim]
+
+    Returns:
+        Attention: shape [batch, head, q_tokens, head_dim] 
+        bwd_normalizing_const: shape [batch*head, q_tokens] used for backward
+    """
+
+    batch, head, q_tokens, q_head_dim = q.shape
+    k_batch, k_head, k_tokens, k_head_dim = k.shape
+    v_batch, v_head, v_tokens, v_head_dim = k.shape
+
+    # q_tokens = q.size(-2)
+    # k_tokens = k.size(-2)
+    # v_tokens = v.size(-2)
+
+    assert k_tokens == v_tokens, "input k_tokens must match v_tokens"
+    assert q_head_dim == k.size(-1) == v.size(-1), "all head dimensions must match for q, k, v tensors"
+
+    # head_dim = q.size(-1)
+
+    head_dim = q_head_dim
+    q_bh = q.reshape([-1, q_tokens, head_dim])
+    k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
+    v_bh = v.reshape([-1, v_tokens, head_dim])
+    bwd_normalizing_const = torch.zeros([batch*head, q_tokens])
+    atten = torch.empty_like(q_bh)
+    sm_scale =  1.0 / math.sqrt(head_dim) 
+
+    qk_scale = sm_scale * 1.44269504 
+    # 1.44269504 = 1/ln(2), 
+    # where ln = log base euler number(2.7182)
+
+    for bh_idx_list, q_idx_list in hl.tile([batch*head, q_tokens]):
+
+        # make buffers
+        qk_max_tile = hl.full([bh_idx_list, q_idx_list], float("-inf"), dtype=torch.float32)
+        exp_qk_sum_tile = torch.full_like(qk_max_tile, 1.0) 
+        exp_qk_v = hl.zeros([bh_idx_list, q_idx_list, head_dim], dtype=torch.float32)
+
+        # load q
+        q_tile = q_bh[bh_idx_list, q_idx_list, :]
+
+        for k_idx_list in hl.tile(k_tokens):
+            # load k
+            k_tile = k_bh[bh_idx_list, :, k_idx_list]
+            
+            # q dot k
+            qk_tile = torch.bmm(q_tile, k_tile) # batch matrix multiply
+
+            # recalculate max tile
+            next_qk_max_tile = torch.max(qk_max_tile, torch.amax(qk_tile, -1) * qk_scale)
+            qk_tile = qk_tile * qk_scale - next_qk_max_tile[:, :, None]
+
+            exp_qk= torch.exp2(qk_tile) 
+            # torch.exp2 is 2 power qk_tile, 
+            # not e power qk_tile, 
+            # qk_scale 1/ln2 with convert to 2 power qk_tile to e power qk_tile
+
+            next_exp_qk_sum_tile = torch.sum(exp_qk, -1)
+
+            rescale = torch.exp2(qk_max_tile - next_qk_max_tile)
+            exp_qk_sum_tile = exp_qk_sum_tile * rescale + next_exp_qk_sum_tile
+            exp_qk_v = exp_qk_v * rescale[:, :, None]
+
+            v_tile = v_bh[bh_idx_list, k_idx_list, :]
+
+            exp_qk = exp_qk.to(v.dtype)
+            exp_qk_v = torch.baddbmm(exp_qk_v, exp_qk, v_tile) 
+            # batch add accumulator to batch matrix multiply exp_qk, v_tile
+            qk_max_tile = next_qk_max_tile
+
+        # if training: 
+        #    qk_max_tile += torch.log2(exp_qk_sum_tile)
+
+
+        # if training: 
+        # store qk_max_tile + log2(exp_qk_sum_tile) to bwd_normalizing_const for backprop
+        bwd_normalizing_const[bh_idx_list, q_idx_list] = qk_max_tile + torch.log2(exp_qk_sum_tile)
+        # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
+
+        atten_tile = exp_qk_v/ exp_qk_sum_tile[:, :, None]
+        atten[bh_idx_list, q_idx_list, :] = atten_tile.to(atten.dtype)
+    
+    return atten.view([batch, head, q_tokens, head_dim]), bwd_normalizing_const
+
+
+if __name__ == "__main__":
+
+    pass
