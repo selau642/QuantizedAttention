@@ -7,5 +7,8 @@ requires-python = ">=3.10.6"
 dependencies = [
     "helion>=0.2.7",
     "numpy>=2.2.6",
+    "packaging>=25.0",
+    "pip>=25.3",
+    "pytest>=9.0.2",
     "torch>=2.9.1",
 ]
