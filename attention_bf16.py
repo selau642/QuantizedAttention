@@ -1,12 +1,33 @@
 import torch
 import helion
 import helion.language as hl
+from torch.nn.attention.flex_attention import flex_attention
 
 import math
 from typing import Tuple
+from typing import cast
+
+from helion._testing import DEVICE
+from helion._testing import run_example
 
 @helion.kernel(
-    static_shapes=True
+    static_shapes=True,
+    # autotune_max_generations=8 
+    # nvidia RTX3080 best config
+    config=helion.Config(
+        block_sizes=[4, 32, 16], 
+        indexing=['pointer', 'pointer', 'block_ptr', 'block_ptr', 'pointer'], 
+        l2_groupings=[64], 
+        load_eviction_policies=['first', 'first', 'last'], 
+        loop_orders=[[1, 0]], 
+        num_stages=3, 
+        num_warps=4, 
+        pid_type='flat', 
+        range_flattens=[None, None], 
+        range_multi_buffers=[None, True], 
+        range_num_stages=[0, 0], 
+        range_unroll_factors=[0, 0], 
+        range_warp_specializes=[]), 
 )
 def atten_fwd_training(
     q: torch.Tensor,
@@ -44,7 +65,7 @@ def atten_fwd_training(
     q_bh = q.reshape([-1, q_tokens, head_dim])
     k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
     v_bh = v.reshape([-1, v_tokens, head_dim])
-    bwd_normalizing_const = torch.zeros([batch*head, q_tokens])
+    bwd_normalizing_const = torch.zeros([batch*head, q_tokens], device=q_bh.device)
     atten = torch.empty_like(q_bh)
     sm_scale =  1.0 / math.sqrt(head_dim) 
 
@@ -103,7 +124,7 @@ def atten_fwd_training(
         atten_tile = exp_qk_v/ exp_qk_sum_tile[:, :, None]
         atten[bh_idx_list, q_idx_list, :] = atten_tile.to(atten.dtype)
     
-    return atten.view([batch, head, q_tokens, head_dim]), bwd_normalizing_const
+    return atten.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
 
 @helion.kernel(
     static_shapes=True
@@ -312,6 +333,80 @@ def atten_bwd(
         dk_bh.view([batch, head, k_tokens, head_dim]), \
         dv_bh.view([batch, head, v_tokens, head_dim])
 
+def test_forward(
+    z: int,
+    h: int,
+    n_ctx: int,
+    head_dim: int,
+    dtype: torch.dtype = torch.float32,
+    device: torch.device | str = "cuda",
+) -> None:
+    """
+    Test the attention kernel implementation against PyTorch's native attention functions.
+
+    Args:
+        z: Batch size
+        h: Number of attention heads
+        n_ctx: Sequence length (context size)
+        head_dim: Dimension of each attention head
+        dtype: Data type for the tensors
+        device: Device to run the test on
+    """
+    q, k, v = [
+        torch.randn((z, h, n_ctx, head_dim), dtype=dtype, device=device)
+        for _ in range(3)
+    ]
+
+    def ref_attention(
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+    ) -> torch.Tensor:
+        """Reference manual attention implementation"""
+        p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+        p = torch.softmax(p.float(), dim=-1).to(dtype)
+        return torch.matmul(p, v)
+
+    flex_compiled = cast(
+        "Callable[..., torch.Tensor]", torch.compile(flex_attention, fullgraph=True)
+    )
+    baselines = {
+        "torch": torch.nn.functional.scaled_dot_product_attention,
+        "flex": flex_compiled,
+        "ref": ref_attention,
+    }
+
+    run_example(atten_fwd_training, baselines, (q, k, v))
+
 if __name__ == "__main__":
 
-    pass
+    # Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
+    test_forward(2, 32, 1024, 64, torch.float16, device=DEVICE)
+
+    """
+    # nvidia RTX3080 best config
+    config=helion.Config(
+        block_sizes=[4, 32, 16], 
+        indexing=['pointer', 'pointer', 'block_ptr', 'block_ptr', 'pointer'], 
+        l2_groupings=[64], 
+        load_eviction_policies=['first', 'first', 'last'], 
+        loop_orders=[[1, 0]], 
+        num_stages=3, 
+        num_warps=4, 
+        pid_type='flat', 
+        range_flattens=[None, None], 
+        range_multi_buffers=[None, True], 
+        range_num_stages=[0, 0], 
+        range_unroll_factors=[0, 0], 
+        range_warp_specializes=[]), 
+
+        =================================================================
+        Benchmark Results
+        =================================================================
+        Implementation       Time (ms)    Speedup
+        -----------------------------------------------------------------
+        helion               0.7240       0.90x
+        torch                0.6528       1.00x (ref) # F.scaled_dot_product
+        flex                 0.6595       0.99x
+        ref                  5.4569       0.12x
+        =================================================================
+
+    """
