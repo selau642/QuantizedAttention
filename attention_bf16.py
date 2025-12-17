@@ -33,6 +33,7 @@ def atten_fwd_training(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    causal: bool
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Computes forward for Attention
@@ -65,52 +66,60 @@ def atten_fwd_training(
     q_bh = q.reshape([-1, q_tokens, head_dim])
     k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
     v_bh = v.reshape([-1, v_tokens, head_dim])
-    bwd_normalizing_const = torch.zeros([batch*head, q_tokens], device=q_bh.device)
-    atten = torch.empty_like(q_bh)
+    bwd_normalizing_blk = torch.zeros([batch*head, q_tokens], device=q_bh.device)
+    atten_out = torch.empty_like(q_bh)
     sm_scale =  1.0 / math.sqrt(head_dim) 
 
-    qk_scale = sm_scale * 1.44269504 
-    # 1.44269504 = 1/ln(2), 
+    qk_scale = sm_scale * 1.44269504089 
+    # 1.44269504089 = 1/ln(2), 
     # where ln = log base euler number(2.7182)
 
-    for bh_idx_list, q_idx_list in hl.tile([batch*head, q_tokens]):
+    for bh_tile , q_tile in hl.tile([batch*head, q_tokens]):
 
         # make buffers
-        qk_max_tile = hl.full([bh_idx_list, q_idx_list], float("-inf"), dtype=torch.float32)
-        exp_qk_sum_tile = torch.full_like(qk_max_tile, 1.0) 
-        exp_qk_v = hl.zeros([bh_idx_list, q_idx_list, head_dim], dtype=torch.float32)
+        qk_max_blk = hl.full([bh_tile, q_tile], float("-inf"), dtype=torch.float32)
+        exp_qk_sum_blk = torch.full_like(qk_max_blk, 1.0) 
+        exp_qk_v_blk = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
 
         # load q
-        q_tile = q_bh[bh_idx_list, q_idx_list, :]
+        q_blk = q_bh[bh_tile, q_tile, :]
 
-        for k_idx_list in hl.tile(k_tokens):
+        for k_tile in hl.tile(k_tokens):
             # load k
-            k_tile = k_bh[bh_idx_list, :, k_idx_list]
+            k_blk = k_bh[bh_tile, :, k_tile]
             
             # q dot k
-            qk_tile = torch.bmm(q_tile, k_tile) # batch matrix multiply
+            qk_blk= torch.bmm(q_blk, k_blk) # batch matrix multiply
+
+            if causal and q_tile.begin < k_tile.end - 1:
+                mask_blk = torch.triu(
+                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
+                    diagonal=q_tile.begin - k_tile.begin + 1
+                    ).to(q_bh.device)
+
+                qk_blk.masked_fill_(mask_blk, float("-inf"))
 
             # recalculate max tile
-            next_qk_max_tile = torch.max(qk_max_tile, torch.amax(qk_tile, -1) * qk_scale)
-            qk_tile = qk_tile * qk_scale - next_qk_max_tile[:, :, None]
+            next_qk_max_blk = torch.max(qk_max_blk, torch.amax(qk_blk, -1) * qk_scale)
+            qk_blk = qk_blk * qk_scale - next_qk_max_blk[:, :, None]
 
-            exp_qk= torch.exp2(qk_tile) 
+            exp_qk_blk = torch.exp2(qk_blk) 
             # torch.exp2 is 2 power qk_tile, 
             # not e power qk_tile, 
             # qk_scale 1/ln2 with convert to 2 power qk_tile to e power qk_tile
 
-            next_exp_qk_sum_tile = torch.sum(exp_qk, -1)
+            next_exp_qk_sum_blk = torch.sum(exp_qk_blk, -1)
 
-            rescale = torch.exp2(qk_max_tile - next_qk_max_tile)
-            exp_qk_sum_tile = exp_qk_sum_tile * rescale + next_exp_qk_sum_tile
-            exp_qk_v = exp_qk_v * rescale[:, :, None]
+            rescale = torch.exp2(qk_max_blk - next_qk_max_blk)
+            exp_qk_sum_blk = exp_qk_sum_blk * rescale + next_exp_qk_sum_blk
+            exp_qk_v_blk = exp_qk_v_blk * rescale[:, :, None]
 
-            v_tile = v_bh[bh_idx_list, k_idx_list, :]
+            v_tile = v_bh[bh_tile, k_tile, :]
 
             exp_qk = exp_qk.to(v.dtype)
-            exp_qk_v = torch.baddbmm(exp_qk_v, exp_qk, v_tile) 
+            exp_qk_v_blk = torch.baddbmm(exp_qk_v_blk, exp_qk, v_tile) 
             # batch add accumulator to batch matrix multiply exp_qk, v_tile
-            qk_max_tile = next_qk_max_tile
+            qk_max_blk = next_qk_max_blk
 
         # if training: 
         #    qk_max_tile += torch.log2(exp_qk_sum_tile)
@@ -118,13 +127,13 @@ def atten_fwd_training(
 
         # if training: 
         # store qk_max_tile + log2(exp_qk_sum_tile) to bwd_normalizing_const for backprop
-        bwd_normalizing_const[bh_idx_list, q_idx_list] = qk_max_tile + torch.log2(exp_qk_sum_tile)
+        bwd_normalizing_blk[bh_tile, q_tile] = qk_max_blk + torch.log2(exp_qk_sum_blk)
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
 
-        atten_tile = exp_qk_v/ exp_qk_sum_tile[:, :, None]
-        atten[bh_idx_list, q_idx_list, :] = atten_tile.to(atten.dtype)
+        atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
+        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten.dtype)
     
-    return atten.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
+    return atten_out.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
 
 @helion.kernel(
     static_shapes=True
@@ -133,6 +142,7 @@ def atten_bf16_fwd_training(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    causal: bool
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Computes forward for Attention in BrainFloat16
@@ -145,7 +155,7 @@ def atten_bf16_fwd_training(
 
     Returns:
         Attention: shape [batch, head, q_tokens, head_dim] 
-        bwd_normalizing_const: shape [batch*head, q_tokens] used for backward
+        bwd_normalizing_blk : shape [batch*head, q_tokens] used for backward
     """
     BETA = 2.0 # suggest testing 2.0 to 8.0 for diff data distributions
 
@@ -166,35 +176,44 @@ def atten_bf16_fwd_training(
     q_bh = q.reshape([-1, q_tokens, head_dim])
     k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
     v_bh = v.reshape([-1, v_tokens, head_dim])
-    bwd_normalizing_const = torch.zeros([batch*head, q_tokens])
-    atten = torch.empty_like(q_bh)
+    bwd_normalizing_blk = torch.zeros([batch*head, q_tokens])
+    atten_out = torch.empty_like(q_bh)
     sm_scale =  1.0 / math.sqrt(head_dim) 
 
     qk_scale = sm_scale * 1.44269504 
     # 1.44269504 = 1/ln(2), 
     # where ln = log base euler number(2.7182)
 
-    for bh_idx_list, q_idx_list in hl.tile([batch*head, q_tokens]):
+    for bh_tile, q_tile in hl.tile([batch*head, q_tokens]):
 
         # make buffers
-        qk_max_tile = hl.full([bh_idx_list, q_idx_list], float("-inf"), dtype=torch.float32)
-        exp_qk_sum_tile = torch.full_like(qk_max_tile, 1.0) 
-        exp_qk_v = hl.zeros([bh_idx_list, q_idx_list, head_dim], dtype=torch.float32)
+        qk_max_blk = hl.full([bh_tile, q_tile], float("-inf"), dtype=torch.float32)
+        exp_qk_sum_blk = torch.full_like(qk_max_blk, 1.0) 
+        exp_qk_v_blk = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
 
         # load q
-        q_tile = q_bh[bh_idx_list, q_idx_list, :]
+        q_blk = q_bh[bh_tile, q_tile, :]
 
-        for k_idx_list in hl.tile(k_tokens):
+        for k_tile in hl.tile(k_tokens):
             # load k
-            k_tile = k_bh[bh_idx_list, :, k_idx_list]
+            k_blk = k_bh[bh_tile, :, k_tile]
             
             # q dot k
-            qk_tile = torch.bmm(q_tile, k_tile) # batch matrix multiply
+            qk_blk = torch.bmm(q_blk, k_blk) # batch matrix multiply
             # qk_tile.shape = [bh_idx_list, q_idx_list, k_idx_list]
 
+            if causal and q_tile.begin < k_tile.end - 1:
+
+                mask_blk = torch.triu(
+                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
+                    diagonal=q_tile.begin - k_tile.begin + 1
+                    ).to(q_bh.device)
+
+                qk_blk.masked_fill_(mask_blk, float("-inf"))
+
             # recalculate max tile
-            next_qk_max_tile = torch.max(qk_max_tile, torch.amax(qk_tile, -1) * qk_scale)
-            # next_qk_max_tile.shape = [bh_idx_list, q_idx_list]
+            next_qk_max_blk = torch.max(qk_max_blk, torch.amax(qk_blk, -1) * qk_scale)
+
             """
 
 
@@ -202,43 +221,42 @@ def atten_bf16_fwd_training(
 
 
             """
-            approx_max = (qk_tile >= (next_qk_max_tile[:, :, None] - 1e-3))
+            approx_max = (qk_blk >= (next_qk_max_blk[:, :, None] - 1e-3))
             num_approx_max = torch.sum(approx_max, dim=-1, keepdims=True)
-            # num_approx_max.shape = [bh_idx_list, q_idx_list, 1]
             more_than_one_approx_max = (num_approx_max > 1)
 
-            next_qk_max_tile = torch.where(
-                more_than_one_approx_max & (next_qk_max_tile > 0), 
-                BETA * next_qk_max_tile, 
-                next_qk_max_tile
+            next_qk_max_blk = torch.where(
+                more_than_one_approx_max & (next_qk_max_blk > 0), 
+                BETA * next_qk_max_blk, 
+                next_qk_max_blk
             )
 
-            next_qk_max_tile = torch.where(
-                more_than_one_approx_max & (next_qk_max_tile < 0), 
+            next_qk_max_blk = torch.where(
+                more_than_one_approx_max & (next_qk_max_blk < 0), 
                 0, 
-                next_qk_max_tile
+                next_qk_max_blk
             )
 
             # rescaling qk_tile
-            qk_tile = qk_tile * qk_scale - next_qk_max_tile[:, :, None]
+            qk_blk = qk_blk * qk_scale - next_qk_max_blk[:, :, None]
 
-            exp_qk= torch.exp2(qk_tile) 
+            exp_qk_blk = torch.exp2(qk_blk) 
             # torch.exp2 is 2 power qk_tile, 
             # not e power qk_tile, 
             # qk_scale 1/ln2 with convert to 2 power qk_tile to e power qk_tile
 
-            next_exp_qk_sum_tile = torch.sum(exp_qk, -1)
+            next_exp_qk_sum_blk = torch.sum(exp_qk_blk, -1)
 
-            rescale = torch.exp2(qk_max_tile - next_qk_max_tile)
-            exp_qk_sum_tile = exp_qk_sum_tile * rescale + next_exp_qk_sum_tile
-            exp_qk_v = exp_qk_v * rescale[:, :, None]
+            rescale = torch.exp2(qk_max_blk - next_qk_max_blk)
+            exp_qk_sum_blk = exp_qk_sum_blk * rescale + next_exp_qk_sum_blk
+            exp_qk_v_blk = exp_qk_v_blk * rescale[:, :, None]
 
-            v_tile = v_bh[bh_idx_list, k_idx_list, :]
+            v_blk = v_bh[bh_tile, k_tile, :]
 
-            exp_qk = exp_qk.to(v.dtype)
-            exp_qk_v = torch.baddbmm(exp_qk_v, exp_qk, v_tile) 
+            exp_qk_blk = exp_qk_blk.to(v.dtype)
+            exp_qk_v_blk = torch.baddbmm(exp_qk_v_blk, exp_qk_blk, v_blk) 
             # batch add accumulator to batch matrix multiply exp_qk, v_tile
-            qk_max_tile = next_qk_max_tile
+            qk_max_blk = next_qk_max_blk
 
         # if training: 
         #    qk_max_tile += torch.log2(exp_qk_sum_tile)
@@ -246,13 +264,13 @@ def atten_bf16_fwd_training(
 
         # if training: 
         # store qk_max_tile + log2(exp_qk_sum_tile) to bwd_normalizing_const for backprop
-        bwd_normalizing_const[bh_idx_list, q_idx_list] = qk_max_tile + torch.log2(exp_qk_sum_tile)
+        bwd_normalizing_blk[bh_tile, q_tile] = qk_max_blk + torch.log2(exp_qk_sum_blk)
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
 
-        atten_tile = exp_qk_v/ exp_qk_sum_tile[:, :, None]
-        atten[bh_idx_list, q_idx_list, :] = atten_tile.to(atten.dtype)
+        atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
+        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten_out.dtype)
     
-    return atten.view([batch, head, q_tokens, head_dim]), bwd_normalizing_const
+    return atten_out.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
 
 
 helion.kernel(
@@ -376,10 +394,15 @@ def test_forward(
 
     run_example(atten_fwd_training, baselines, (q, k, v))
 
+    helion_t = atten_fwd_training(q, k, v)
+    pytorch_t = ref_attention(q, k, v)
+    torch.testing.assert_close(pytorch_t, helion_t, atol=1e-2, rtol=0)
+
+
 if __name__ == "__main__":
 
     # Tests with batch size 2, 32 heads, 1024 sequence length, and 64-dimensional heads using float16.
-    test_forward(2, 32, 1024, 64, torch.float16, device=DEVICE)
+    test_forward(2, 32, 1024, 64, torch.float32, device=DEVICE)
 
     """
     # nvidia RTX3080 best config
