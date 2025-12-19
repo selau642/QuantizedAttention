@@ -45,7 +45,8 @@ class FlashAttention_2_BF16_autograd_function(Function):
             v,   
             atten_bf16,
             bwd_normalizing_blk,
-            d_atten
+            d_atten, 
+            causal
         )
 
         return dq, dk, dv
@@ -316,7 +317,122 @@ def helion_atten_bf16_fwd_training(
 helion.kernel(
     static_shapes=True
 )
-def helion_atten_bwd(
+def helion_flash_atten_2_algo_4(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,   
+    atten: torch.Tensor,
+    bwd_normalizing_const: torch.Tensor,
+    d_atten: torch.Tensor,
+    causal: bool
+):
+    """
+    Computes backward for Attention in Float32 
+    Using FlashAtten 2 Algo 4
+        Attention = Softmax(Q * K_T/SQRT(d_k)) * V
+
+    Args:
+        q: Query shape [batch, head, q_tokens, head_dim]
+        k: Key shape [batch, head, k_tokens, head_dim]
+        v: Value shape [batch, head, v_tokens, head_dim]
+        atten: Atten shape [batch, head, v_tokens, head_dim]
+        bwd_normalizing_const: logit of (exp - max_row) / sum_exp, shape [batch*head, q_tokens]
+
+        d_atten: Atten shape [batch, head, q_tokens, head_dim]
+
+    Returns:
+    """
+
+    batch, head, q_tokens, q_head_dim = q.shape
+    k_batch, k_head, k_tokens, k_head_dim = k.shape
+    v_batch, v_head, v_tokens, v_head_dim = k.shape
+
+    head_dim = q_head_dim
+    q_bh = q.reshape([-1, q_tokens, head_dim])
+    k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
+    v_bh = v.reshape([-1, v_tokens, head_dim])
+    q_device = q.device
+    atten_bh = atten.reshape([-1, q_tokens, head_dim])
+    d_atten_bh = d_atten.reshape([-1, q_tokens, head_dim])
+
+
+    sm_scale =  1.0 / math.sqrt(head_dim) 
+    qk_scale = sm_scale * 1.44269504 
+
+    dq_bh = torch.zeros_like(q_bh)
+    dk_bh = torch.zeros_like(k_bh)
+    dv_bh = torch.zeros_like(v_bh)
+
+    for bh_tile, k_tile in hl.tile([batch*head, k_tokens]):
+
+        k_blk = k_bh[bh_tile, :, k_tile]
+        # q_tile.shape = [bh, q, head_dim]
+
+        v_blk = v_bh[bh_tile, k_tile, :]
+        # v_tile.shape = [bh, q, head_dim]
+
+        dk_blk = hl.zeros((bh_tile, k_tile, head_dim), device=q_device)
+        dv_blk = hl.zeros((bh_tile, k_tile, head_dim), device=q_device)
+
+        for q_tile in hl.tile(q_tokens):
+
+            bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
+            q_blk = q_bh[bh_tile, q_tile, :]
+
+            atten_blk = atten_bh[bh_tile, q_tile, k_tile]
+            # q dot k
+            qk_blk = torch.bmm(q_blk, k_blk) * qk_scale # batch matrix multiply
+            if causal and q_tile.begin < k_tile.end - 1:
+
+                mask_blk = torch.triu(
+                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
+                    diagonal=q_tile.begin - k_tile.begin + 1
+                    ).to(q_bh.device)
+
+                qk_blk.masked_fill_(mask_blk, float("-inf"))
+
+            exp_qk_blk = torch.exp2(qk_blk) * bwd_normalizing_const_tile 
+            # exp_qk.shape = [bh, q, k]
+
+            d_atten_blk = d_atten_bh[bh_tile, q_tile, :]
+            # d_atten_blk.shape = [bh, q, head_dim]
+
+            dv_blk += torch.bmm(exp_qk_blk.transpose(-1, -2), d_atten_blk)
+            # [bh, k, q] @ [bh, q, head_dim]
+            # dv_blk.shape = [bh, k, head_dim]
+
+            dp_blk = torch.bmm(d_atten_blk, v_blk.transpose(-1, -2))
+            # [bh, q, head_dim] @ [bh, head_dim, k]
+            # dp_blk.shape = [bh, q, k]
+
+            D_blk = torch.sum(d_atten_blk * atten_blk, dim=-1, keepdims=True)
+            # [bh, q, head_dim] elem_wise [bh, q, head_dim]
+            # sum on head_dim [bh, q, head_dim]
+            # [bh, q, 1]
+
+            d_softmax_blk = qk_blk * (dp_blk - D_blk)
+            # [bh, q, k] @ ([bh, q, k] - [bh, q, 1])
+            # [bh, q, k]
+
+            dq_bh[bh_tile, q_tile,:] += qk_scale * torch.bmm(d_softmax_blk, k_tile)
+            # [bh, q, k] @ [bh, k, head_dim]
+            # dq_bh.shape = [bh, q, head_dim]
+
+            dk_blk += torch.bmm(d_softmax_blk.transpose(-1, -2), q_tile)
+            # [bh, k, q] @ [bh, q, head]
+            # dk_tile.shape = [bh, k, head_dim]
+
+        dk_bh[bh_tile, k_tile, :] = dk_blk
+        dv_bh[bh_tile, k_tile, :] = dv_blk
+
+    return dq_bh.view([batch, head, q_tokens, head_dim]), \
+        dk_bh.view([batch, head, k_tokens, head_dim]), \
+        dv_bh.view([batch, head, v_tokens, head_dim])
+
+helion.kernel(
+    static_shapes=True
+)
+def helion_atten_bwd_bf16_paper(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,   
@@ -423,6 +539,7 @@ def helion_atten_bwd(
     return dq_bh.view([batch, head, q_tokens, head_dim]), \
         dk_bh.view([batch, head, k_tokens, head_dim]), \
         dv_bh.view([batch, head, v_tokens, head_dim])
+
 
 def test_forward(
     z: int,
