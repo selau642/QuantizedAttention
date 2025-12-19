@@ -10,6 +10,46 @@ from typing import cast
 from helion._testing import DEVICE
 from helion._testing import run_example
 
+from torch.autograd import Function
+
+class FlashAttention_2_BF16_autograd_function(Function):
+    """
+
+    forward in bf16
+    backward in fp32
+
+    """
+    @staticmethod
+    def forward(
+        ctx, 
+        q: torch.Tensor, 
+        k: torch.Tensor, 
+        v: torch.Tensor, 
+        causal: bool
+    ):
+        atten_bf16, bwd_normalizing_blk = helion_atten_bf16_fwd_training(q,k,v, causal) 
+
+        ctx.args = (causal,)
+        ctx.save_for_backward(q, k, v, atten_bf16, bwd_normalizing_blk)
+
+    @staticmethod
+    def backward(
+        ctx,
+        d_atten
+    ):
+        q, k, v, atten_bf16, bwd_normalizing_blk = ctx.saved_tensors
+        causal = ctx.args
+        dq, dk, dv = helion_atten_bwd(
+            q,
+            k,
+            v,   
+            atten_bf16,
+            bwd_normalizing_blk,
+            d_atten
+        )
+
+        return dq, dk, dv
+
 @helion.kernel(
     static_shapes=True,
     # autotune_max_generations=8 
@@ -131,14 +171,14 @@ def atten_fwd_training(
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
 
         atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
-        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten.dtype)
+        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten_out.dtype)
     
-    return atten_out.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
+    return atten_out.view([batch, head, q_tokens, head_dim]), bwd_normalizing_blk
 
 @helion.kernel(
     static_shapes=True
 )
-def atten_bf16_fwd_training(
+def helion_atten_bf16_fwd_training(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -270,13 +310,13 @@ def atten_bf16_fwd_training(
         atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
         atten_out[bh_tile, q_tile, :] = atten_blk.to(atten_out.dtype)
     
-    return atten_out.view([batch, head, q_tokens, head_dim]) #, bwd_normalizing_const
+    return atten_out.view([batch, head, q_tokens, head_dim]), bwd_normalizing_blk
 
 
 helion.kernel(
     static_shapes=True
 )
-def atten_bwd(
+def helion_atten_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,   
@@ -322,7 +362,10 @@ def atten_bwd(
     for bh_idx_list, q_idx_list in hl.tile([batch*head, q_tokens]):
 
         q_tile = q_bh[bh_idx_list, q_idx_list, :]
+        # q_tile.shape = [bh, q, head_dim]
+
         v_tile = v_bh[bh_idx_list, q_idx_list, :]
+        # v_tile.shape = [bh, q, head_dim]
 
         bwd_normalizing_const_tile = bwd_normalizing_const[bh_idx_list, q_idx_list]
 
@@ -331,17 +374,37 @@ def atten_bwd(
             atten_tile = atten_bh[bh_idx_list, q_idx_list, k_idx_list]
             # q dot k
             qk_tile = torch.bmm(q_tile, k_tile) * qk_scale # batch matrix multiply
+
             exp_qk= torch.exp2(qk_tile) * bwd_normalizing_const_tile 
+            # exp_qk.shape = [bh, q, k]
 
-            d_atten_tile = d_atten_bh[bh_idx_list, q_idx_list, ]
+            d_atten_tile = d_atten_bh[bh_idx_list, q_idx_list, :]
+            # d_atten_tile.shape = [bh, q, head_dim]
 
-            dv_tile = torch.bmm(exp_qk, d_atten_tile)
-            dp_tile = torch.bmm(d_atten_tile, v_tile)
+            dv_tile = torch.bmm(exp_qk.transpose(-1, -2), d_atten_tile)
+            # [bh, k, q] @ [bh, q, head_dim]
+            # dv_tile.shape = [bh, k, head_dim]
+
+            dp_tile = torch.bmm(d_atten_tile, v_tile.transpose(-1, -2))
+            # [bh, q, head_dim] @ [bh, head_dim, k]
+            # dp_tile.shape = [bh, q, k]
+
             atten_jvp = torch.sum(d_atten_tile * atten_tile, dim=-1, keepdims=True)
-            d_softmax = qk_tile * qk_scale * (dp_tile - atten_jvp)
+            # [bh, q, head_dim] elem_wise [bh, q, head_dim]
+            # sum on head_dim [bh, q, head_dim]
+            # [bh, q, 1]
 
-            dk_tile = torch.bmm(d_softmax, k_tile)
-            dq_tile = torch.bmm(d_softmax, q_tile)
+            d_softmax = qk_tile * qk_scale * (dp_tile - atten_jvp)
+            # [bh, q, k] @ ([bh, q, k] - [bh, q, 1])
+            # [bh, q, k]
+
+            dq_tile = torch.bmm(d_softmax, k_tile)
+            # [bh, q, k] @ [bh, k, head_dim]
+            # dq_tile.shape = [bh, q, head_dim]
+
+            dk_tile = torch.bmm(d_softmax.transpose(-1, -2), q_tile)
+            # [bh, k, q] @ [bh, q, head]
+            # dk_tile.shape = [bh, k, head_dim]
 
             dq_bh[bh_idx_list, q_idx_list, :] = dq_tile 
             dk_bh[bh_idx_list, k_idx_list, :] = dk_tile
