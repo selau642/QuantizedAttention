@@ -359,26 +359,26 @@ def helion_atten_bwd(
     dk_bh = torch.zeros_like(k_bh)
     dv_bh = torch.zeros_like(v_bh)
 
-    for bh_idx_list, q_idx_list in hl.tile([batch*head, q_tokens]):
+    for bh_tile, q_tile in hl.tile([batch*head, q_tokens]):
 
-        q_tile = q_bh[bh_idx_list, q_idx_list, :]
+        q_tile = q_bh[bh_tile, q_tile, :]
         # q_tile.shape = [bh, q, head_dim]
 
-        v_tile = v_bh[bh_idx_list, q_idx_list, :]
+        v_tile = v_bh[bh_tile, q_tile, :]
         # v_tile.shape = [bh, q, head_dim]
 
-        bwd_normalizing_const_tile = bwd_normalizing_const[bh_idx_list, q_idx_list]
+        bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
 
-        for k_idx_list in hl.tile(k_tokens):
-            k_tile = k_bh[bh_idx_list, :, k_idx_list]
-            atten_tile = atten_bh[bh_idx_list, q_idx_list, k_idx_list]
+        for k_tile in hl.tile(k_tokens):
+            k_tile = k_bh[bh_tile, :, k_tile]
+            atten_tile = atten_bh[bh_tile, q_tile, k_tile]
             # q dot k
             qk_tile = torch.bmm(q_tile, k_tile) * qk_scale # batch matrix multiply
 
             exp_qk= torch.exp2(qk_tile) * bwd_normalizing_const_tile 
             # exp_qk.shape = [bh, q, k]
 
-            d_atten_tile = d_atten_bh[bh_idx_list, q_idx_list, :]
+            d_atten_tile = d_atten_bh[bh_tile, q_tile, :]
             # d_atten_tile.shape = [bh, q, head_dim]
 
             dv_tile = torch.bmm(exp_qk.transpose(-1, -2), d_atten_tile)
@@ -406,9 +406,9 @@ def helion_atten_bwd(
             # [bh, k, q] @ [bh, q, head]
             # dk_tile.shape = [bh, k, head_dim]
 
-            dq_bh[bh_idx_list, q_idx_list, :] = dq_tile 
-            dk_bh[bh_idx_list, k_idx_list, :] = dk_tile
-            dv_bh[bh_idx_list, k_idx_list, :] = dv_tile
+            dq_bh[bh_tile, q_tile, :] = dq_tile 
+            dk_bh[bh_tile, k_tile, :] = dk_tile
+            dv_bh[bh_tile, k_tile, :] = dv_tile
 
     return dq_bh.view([batch, head, q_tokens, head_dim]), \
         dk_bh.view([batch, head, k_tokens, head_dim]), \
