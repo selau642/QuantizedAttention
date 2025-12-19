@@ -322,10 +322,11 @@ def helion_atten_bwd(
     v: torch.Tensor,   
     atten: torch.Tensor,
     bwd_normalizing_const: torch.Tensor,
-    d_atten: torch.Tensor
+    d_atten: torch.Tensor,
+    causal: bool
 ):
     """
-    Computes backward for Attention in BrainFloat16
+    Computes backward for Attention in Float32
         Attention = Softmax(Q * K_T/SQRT(d_k)) * V
 
     Args:
@@ -361,54 +362,63 @@ def helion_atten_bwd(
 
     for bh_tile, q_tile in hl.tile([batch*head, q_tokens]):
 
-        q_tile = q_bh[bh_tile, q_tile, :]
+        q_blk = q_bh[bh_tile, q_tile, :]
         # q_tile.shape = [bh, q, head_dim]
 
-        v_tile = v_bh[bh_tile, q_tile, :]
+        v_blk = v_bh[bh_tile, q_tile, :]
         # v_tile.shape = [bh, q, head_dim]
 
         bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
 
         for k_tile in hl.tile(k_tokens):
-            k_tile = k_bh[bh_tile, :, k_tile]
-            atten_tile = atten_bh[bh_tile, q_tile, k_tile]
+            k_blk = k_bh[bh_tile, :, k_tile]
+            atten_blk = atten_bh[bh_tile, q_tile, k_tile]
             # q dot k
-            qk_tile = torch.bmm(q_tile, k_tile) * qk_scale # batch matrix multiply
+            qk_blk = torch.bmm(q_blk, k_blk) * qk_scale # batch matrix multiply
 
-            exp_qk= torch.exp2(qk_tile) * bwd_normalizing_const_tile 
+            if causal and q_tile.begin < k_tile.end - 1:
+
+                mask_blk = torch.triu(
+                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
+                    diagonal=q_tile.begin - k_tile.begin + 1
+                    ).to(q_bh.device)
+
+                qk_blk.masked_fill_(mask_blk, float("-inf"))
+
+            exp_qk_blk = torch.exp2(qk_blk) * bwd_normalizing_const_tile 
             # exp_qk.shape = [bh, q, k]
 
-            d_atten_tile = d_atten_bh[bh_tile, q_tile, :]
+            d_atten_blk = d_atten_bh[bh_tile, q_tile, :]
             # d_atten_tile.shape = [bh, q, head_dim]
 
-            dv_tile = torch.bmm(exp_qk.transpose(-1, -2), d_atten_tile)
+            dv_blk = torch.bmm(exp_qk_blk.transpose(-1, -2), d_atten_blk)
             # [bh, k, q] @ [bh, q, head_dim]
             # dv_tile.shape = [bh, k, head_dim]
 
-            dp_tile = torch.bmm(d_atten_tile, v_tile.transpose(-1, -2))
+            dp_blk = torch.bmm(d_atten_blk, v_blk.transpose(-1, -2))
             # [bh, q, head_dim] @ [bh, head_dim, k]
             # dp_tile.shape = [bh, q, k]
 
-            atten_jvp = torch.sum(d_atten_tile * atten_tile, dim=-1, keepdims=True)
+            atten_jvp = torch.sum(d_atten_blk * atten_blk, dim=-1, keepdims=True)
             # [bh, q, head_dim] elem_wise [bh, q, head_dim]
             # sum on head_dim [bh, q, head_dim]
             # [bh, q, 1]
 
-            d_softmax = qk_tile * qk_scale * (dp_tile - atten_jvp)
+            d_softmax_blk = qk_blk * qk_scale * (dp_blk - atten_jvp)
             # [bh, q, k] @ ([bh, q, k] - [bh, q, 1])
             # [bh, q, k]
 
-            dq_tile = torch.bmm(d_softmax, k_tile)
+            dq_blk = torch.bmm(d_softmax_blk, k_tile)
             # [bh, q, k] @ [bh, k, head_dim]
             # dq_tile.shape = [bh, q, head_dim]
 
-            dk_tile = torch.bmm(d_softmax.transpose(-1, -2), q_tile)
+            dk_blk = torch.bmm(d_softmax_blk.transpose(-1, -2), q_tile)
             # [bh, k, q] @ [bh, q, head]
             # dk_tile.shape = [bh, k, head_dim]
 
-            dq_bh[bh_tile, q_tile, :] = dq_tile 
-            dk_bh[bh_tile, k_tile, :] = dk_tile
-            dv_bh[bh_tile, k_tile, :] = dv_tile
+            dq_bh[bh_tile, q_tile, :] = dq_blk
+            dk_bh[bh_tile, k_tile, :] = dk_blk
+            dv_bh[bh_tile, k_tile, :] = dv_blk
 
     return dq_bh.view([batch, head, q_tokens, head_dim]), \
         dk_bh.view([batch, head, k_tokens, head_dim]), \
