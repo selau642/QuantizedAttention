@@ -418,7 +418,7 @@ def helion_flash_atten_2_algo_4(
             # [bh, q, k] @ [bh, k, head_dim]
             # dq_bh.shape = [bh, q, head_dim]
 
-            dk_blk += torch.bmm(d_softmax_blk.transpose(-1, -2), q_tile)
+            dk_blk += qk_scale * torch.bmm(d_softmax_blk.transpose(-1, -2), q_tile)
             # [bh, k, q] @ [bh, q, head]
             # dk_tile.shape = [bh, k, head_dim]
 
