@@ -189,6 +189,19 @@ def helion_atten_bf16_fwd_training(
     Computes forward for Attention in BrainFloat16
         Attention = Softmax(Q * K_T/SQRT(d_k)) * V
 
+    1. bf16 has larger range but less mantissa(less range around 0) 
+    2. fp16 has better decimal less range
+
+    => prob logits in bf16, actual probs in fp16/fp32
+
+    sum = mantissa fp16/fp32
+    division = mantissa fp16/fp32
+    multiply probs < 1 = like division = mantissa fp16/fp32
+
+    multiply values > 1 = range bf16
+    exp = range bf16
+    dot_product = multiply and sum (information in cosine similarity which is angles = mantissa more important)
+
     Args:
         q: Query shape [batch, head, q_tokens, head_dim]
         k: Key shape [batch, head, k_tokens, head_dim]
@@ -198,7 +211,7 @@ def helion_atten_bf16_fwd_training(
         Attention: shape [batch, head, q_tokens, head_dim] 
         bwd_normalizing_blk : shape [batch*head, q_tokens] used for backward
     """
-    BETA = 2.0 # suggest testing 2.0 to 8.0 for diff data distributions
+    BETA = 8.0 # suggest testing 2.0 to 8.0 for diff data distributions
 
     batch, head, q_tokens, q_head_dim = q.shape
     k_batch, k_head, k_tokens, k_head_dim = k.shape
@@ -214,11 +227,12 @@ def helion_atten_bf16_fwd_training(
     # head_dim = q.size(-1)
 
     head_dim = q_head_dim
-    q_bh = q.reshape([-1, q_tokens, head_dim])
-    k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
-    v_bh = v.reshape([-1, v_tokens, head_dim])
-    bwd_normalizing_blk = torch.zeros([batch*head, q_tokens])
-    atten_out = torch.empty_like(q_bh)
+    q_bh_fp16 = q.reshape([-1, q_tokens, head_dim])
+    k_bh_fp16 = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
+    v_bh_bf16 = v.reshape([-1, v_tokens, head_dim], dtype=torch.bfloat16)
+
+    bwd_normalizing_blk_fp32 = torch.zeros([batch*head, q_tokens], dtype=torch.float32)
+    atten_out_fp32 = torch.empty_like(q_bh_fp16, dtype=torch.float32)
     sm_scale =  1.0 / math.sqrt(head_dim) 
 
     qk_scale = sm_scale * 1.44269504 
@@ -228,19 +242,21 @@ def helion_atten_bf16_fwd_training(
     for bh_tile, q_tile in hl.tile([batch*head, q_tokens]):
 
         # make buffers
-        qk_max_blk = hl.full([bh_tile, q_tile], float("-inf"), dtype=torch.float32)
-        exp_qk_sum_blk = torch.full_like(qk_max_blk, 1.0) 
-        exp_qk_v_blk = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
+        qk_max_blk_bf16 = hl.full([bh_tile, q_tile], float("-inf"), dtype=torch.bfloat16)
+        exp_qk_sum_blk_fp32 = torch.full_like(qk_max_blk_bf16, 1.0, dtype=torch.float32) 
+        exp_qk_v_blk_bf16 = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.bfloat16)
 
         # load q
-        q_blk = q_bh[bh_tile, q_tile, :]
+        q_blk_fp16 = q_bh_fp16[bh_tile, q_tile, :]
 
         for k_tile in hl.tile(k_tokens):
             # load k
-            k_blk = k_bh[bh_tile, :, k_tile]
+            k_blk_fp16 = k_bh_fp16[bh_tile, :, k_tile]
             
             # q dot k
-            qk_blk = torch.bmm(q_blk, k_blk) # batch matrix multiply
+            qk_blk_bf16 = torch.bmm(q_blk_fp16, k_blk_fp16, out_dtype=torch.bfloat16) 
+            # batch matrix multiply
+            # fp16 inputs will still accumulate in fp32
             # qk_tile.shape = [bh_idx_list, q_idx_list, k_idx_list]
 
             if causal and q_tile.begin < k_tile.end - 1:
@@ -248,12 +264,12 @@ def helion_atten_bf16_fwd_training(
                 mask_blk = torch.triu(
                     torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
                     diagonal=q_tile.begin - k_tile.begin + 1
-                    ).to(q_bh.device)
+                    ).to(q_bh_fp16.device)
 
-                qk_blk.masked_fill_(mask_blk, float("-inf"))
+                qk_blk_bf16.masked_fill_(mask_blk, float("-inf"))
 
             # recalculate max tile
-            next_qk_max_blk = torch.max(qk_max_blk, torch.amax(qk_blk, -1) * qk_scale)
+            next_qk_max_blk_bf16 = torch.max(qk_max_blk_bf16, torch.amax(qk_blk_bf16, -1) * qk_scale)
 
             """
 
@@ -262,42 +278,43 @@ def helion_atten_bf16_fwd_training(
 
 
             """
-            approx_max = (qk_blk >= (next_qk_max_blk[:, :, None] - 1e-3))
+            approx_max = (qk_blk_bf16 >= (next_qk_max_blk_bf16[:, :, None] - 1e-3))
             num_approx_max = torch.sum(approx_max, dim=-1, keepdims=True)
             more_than_one_approx_max = (num_approx_max > 1)
 
-            next_qk_max_blk = torch.where(
-                more_than_one_approx_max & (next_qk_max_blk > 0), 
-                BETA * next_qk_max_blk, 
-                next_qk_max_blk
+            next_qk_max_blk_bf16 = torch.where(
+                more_than_one_approx_max & (next_qk_max_blk_bf16 > 0), 
+                BETA * next_qk_max_blk_bf16, 
+                next_qk_max_blk_bf16
             )
 
-            next_qk_max_blk = torch.where(
-                more_than_one_approx_max & (next_qk_max_blk < 0), 
+            next_qk_max_blk_bf16 = torch.where(
+                more_than_one_approx_max & (next_qk_max_blk_bf16 < 0), 
                 0, 
-                next_qk_max_blk
+                next_qk_max_blk_bf16
             )
 
             # rescaling qk_tile
-            qk_blk = qk_blk * qk_scale - next_qk_max_blk[:, :, None]
+            qk_blk_bf16 = qk_blk_bf16 * qk_scale - next_qk_max_blk_bf16[:, :, None]
 
-            exp_qk_blk = torch.exp2(qk_blk) 
+            exp_qk_blk_bf16 = torch.exp2(qk_blk_bf16) 
             # torch.exp2 is 2 power qk_tile, 
             # not e power qk_tile, 
             # qk_scale 1/ln2 with convert to 2 power qk_tile to e power qk_tile
 
-            next_exp_qk_sum_blk = torch.sum(exp_qk_blk, -1)
+            next_exp_qk_sum_blk_fp32 = torch.sum(exp_qk_blk_bf16.to(torch.float32), -1)
 
-            rescale = torch.exp2(qk_max_blk - next_qk_max_blk)
-            exp_qk_sum_blk = exp_qk_sum_blk * rescale + next_exp_qk_sum_blk
-            exp_qk_v_blk = exp_qk_v_blk * rescale[:, :, None]
+            rescale_bf16 = torch.exp2(qk_max_blk_bf16 - next_qk_max_blk_bf16)
+            exp_qk_sum_blk_fp32 = exp_qk_sum_blk_fp32 * rescale_bf16.to(torch.float32) + next_exp_qk_sum_blk_fp32
+            exp_qk_v_blk_bf16 = exp_qk_v_blk_bf16 * rescale_bf16[:, :, None]
 
-            v_blk = v_bh[bh_tile, k_tile, :]
+            v_blk_bf16 = v_bh_bf16[bh_tile, k_tile, :]
 
-            exp_qk_blk = exp_qk_blk.to(v.dtype)
-            exp_qk_v_blk = torch.baddbmm(exp_qk_v_blk, exp_qk_blk, v_blk) 
+            #exp_qk_blk = exp_qk_blk_bf16.to(v.dtype)
+
+            exp_qk_v_blk_bf16 = torch.baddbmm(exp_qk_v_blk_bf16, exp_qk_blk_bf16, v_blk_bf16) 
             # batch add accumulator to batch matrix multiply exp_qk, v_tile
-            qk_max_blk = next_qk_max_blk
+            qk_max_blk_bf16 = next_qk_max_blk_bf16
 
         # if training: 
         #    qk_max_tile += torch.log2(exp_qk_sum_tile)
@@ -305,13 +322,13 @@ def helion_atten_bf16_fwd_training(
 
         # if training: 
         # store qk_max_tile + log2(exp_qk_sum_tile) to bwd_normalizing_const for backprop
-        bwd_normalizing_blk[bh_tile, q_tile] = qk_max_blk + torch.log2(exp_qk_sum_blk)
+        bwd_normalizing_blk_fp32[bh_tile, q_tile] = qk_max_blk_bf16.to(torch.float32) + torch.log2(exp_qk_sum_blk_fp32)
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
 
-        atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
-        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten_out.dtype)
+        atten_blk_fp32 = exp_qk_v_blk_bf16/ exp_qk_sum_blk_fp32[:, :, None].to(torch.bfloat16)
+        atten_out_fp32[bh_tile, q_tile, :] = atten_blk_fp32.to(torch.float32)
     
-    return atten_out.view([batch, head, q_tokens, head_dim]), bwd_normalizing_blk
+    return atten_out_fp32.view([batch, head, q_tokens, head_dim]), bwd_normalizing_blk_fp32
 
 
 helion.kernel(
@@ -405,6 +422,9 @@ def helion_flash_atten_2_algo_4(
             # [bh, q, head_dim] @ [bh, head_dim, k]
             # dp_blk.shape = [bh, q, k]
 
+            """
+            where overflow occurs dO * O sum in bf16
+            """
             D_blk = torch.sum(d_atten_blk * atten_blk, dim=-1, keepdims=True)
             # [bh, q, head_dim] elem_wise [bh, q, head_dim]
             # sum on head_dim [bh, q, head_dim]
