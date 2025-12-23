@@ -37,9 +37,14 @@ class FlashAttention_2_BF16_autograd_function(Function):
         ctx,
         d_atten
     ):
+        """
+
+        Backward in standard fp32
+
+        """
         q, k, v, atten_bf16, bwd_normalizing_blk = ctx.saved_tensors
         causal = ctx.args
-        dq, dk, dv = helion_atten_bwd(
+        dq, dk, dv = helion_flash_atten_2_algo_4(
             q,
             k,
             v,   
@@ -51,130 +56,6 @@ class FlashAttention_2_BF16_autograd_function(Function):
 
         return dq, dk, dv
 
-@helion.kernel(
-    static_shapes=True,
-    # autotune_max_generations=8 
-    # nvidia RTX3080 best config
-    config=helion.Config(
-        block_sizes=[4, 32, 16], 
-        indexing=['pointer', 'pointer', 'block_ptr', 'block_ptr', 'pointer'], 
-        l2_groupings=[64], 
-        load_eviction_policies=['first', 'first', 'last'], 
-        loop_orders=[[1, 0]], 
-        num_stages=3, 
-        num_warps=4, 
-        pid_type='flat', 
-        range_flattens=[None, None], 
-        range_multi_buffers=[None, True], 
-        range_num_stages=[0, 0], 
-        range_unroll_factors=[0, 0], 
-        range_warp_specializes=[]), 
-)
-def atten_fwd_training(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    causal: bool
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Computes forward for Attention
-        Attention = Softmax(Q * K_T/SQRT(d_k)) * V
-
-    Args:
-        q: Query shape [batch, head, q_tokens, head_dim]
-        k: Key shape [batch, head, k_tokens, head_dim]
-        v: Value shape [batch, head, v_tokens, head_dim]
-
-    Returns:
-        Attention: shape [batch, head, q_tokens, head_dim] 
-        bwd_normalizing_const: shape [batch*head, q_tokens] used for backward
-    """
-
-    batch, head, q_tokens, q_head_dim = q.shape
-    k_batch, k_head, k_tokens, k_head_dim = k.shape
-    v_batch, v_head, v_tokens, v_head_dim = k.shape
-
-    # q_tokens = q.size(-2)
-    # k_tokens = k.size(-2)
-    # v_tokens = v.size(-2)
-
-    assert k_tokens == v_tokens, "input k_tokens must match v_tokens"
-    assert q_head_dim == k.size(-1) == v.size(-1), "all head dimensions must match for q, k, v tensors"
-
-    # head_dim = q.size(-1)
-
-    head_dim = q_head_dim
-    q_bh = q.reshape([-1, q_tokens, head_dim])
-    k_bh = k.reshape([-1, k_tokens, head_dim]).transpose(1, 2)
-    v_bh = v.reshape([-1, v_tokens, head_dim])
-    bwd_normalizing_blk = torch.zeros([batch*head, q_tokens], device=q_bh.device)
-    atten_out = torch.empty_like(q_bh)
-    sm_scale =  1.0 / math.sqrt(head_dim) 
-
-    qk_scale = sm_scale * 1.44269504089 
-    # 1.44269504089 = 1/ln(2), 
-    # where ln = log base euler number(2.7182)
-
-    for bh_tile , q_tile in hl.tile([batch*head, q_tokens]):
-
-        # make buffers
-        qk_max_blk = hl.full([bh_tile, q_tile], float("-inf"), dtype=torch.float32)
-        exp_qk_sum_blk = torch.full_like(qk_max_blk, 1.0) 
-        exp_qk_v_blk = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
-
-        # load q
-        q_blk = q_bh[bh_tile, q_tile, :]
-
-        for k_tile in hl.tile(k_tokens):
-            # load k
-            k_blk = k_bh[bh_tile, :, k_tile]
-            
-            # q dot k
-            qk_blk= torch.bmm(q_blk, k_blk) # batch matrix multiply
-
-            if causal and q_tile.begin < k_tile.end - 1:
-                mask_blk = torch.triu(
-                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
-                    diagonal=q_tile.begin - k_tile.begin + 1
-                    ).to(q_bh.device)
-
-                qk_blk.masked_fill_(mask_blk, float("-inf"))
-
-            # recalculate max tile
-            next_qk_max_blk = torch.max(qk_max_blk, torch.amax(qk_blk, -1) * qk_scale)
-            qk_blk = qk_blk * qk_scale - next_qk_max_blk[:, :, None]
-
-            exp_qk_blk = torch.exp2(qk_blk) 
-            # torch.exp2 is 2 power qk_tile, 
-            # not e power qk_tile, 
-            # qk_scale 1/ln2 with convert to 2 power qk_tile to e power qk_tile
-
-            next_exp_qk_sum_blk = torch.sum(exp_qk_blk, -1)
-
-            rescale = torch.exp2(qk_max_blk - next_qk_max_blk)
-            exp_qk_sum_blk = exp_qk_sum_blk * rescale + next_exp_qk_sum_blk
-            exp_qk_v_blk = exp_qk_v_blk * rescale[:, :, None]
-
-            v_tile = v_bh[bh_tile, k_tile, :]
-
-            exp_qk = exp_qk.to(v.dtype)
-            exp_qk_v_blk = torch.baddbmm(exp_qk_v_blk, exp_qk, v_tile) 
-            # batch add accumulator to batch matrix multiply exp_qk, v_tile
-            qk_max_blk = next_qk_max_blk
-
-        # if training: 
-        #    qk_max_tile += torch.log2(exp_qk_sum_tile)
-
-
-        # if training: 
-        # store qk_max_tile + log2(exp_qk_sum_tile) to bwd_normalizing_const for backprop
-        bwd_normalizing_blk[bh_tile, q_tile] = qk_max_blk + torch.log2(exp_qk_sum_blk)
-        # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
-
-        atten_blk = exp_qk_v_blk/ exp_qk_sum_blk[:, :, None]
-        atten_out[bh_tile, q_tile, :] = atten_blk.to(atten_out.dtype)
-    
-    return atten_out.view([batch, head, q_tokens, head_dim]), bwd_normalizing_blk
 
 @helion.kernel(
     autotune_effort="none",
@@ -393,6 +274,7 @@ def helion_flash_atten_2_algo_4(
     dq_bh = torch.zeros_like(q_bh)
     dk_bh = torch.zeros_like(k_bh)
     dv_bh = torch.zeros_like(v_bh)
+    cuda_device = q.device
 
     for bh_tile, k_tile in hl.tile([batch*head, k_tokens]):
 
@@ -405,7 +287,11 @@ def helion_flash_atten_2_algo_4(
         dk_blk = hl.zeros((bh_tile, k_tile, head_dim), device=q_device)
         dv_blk = hl.zeros((bh_tile, k_tile, head_dim), device=q_device)
 
+        begin_k = k_tile.begin
+        end_k = k_tile.end
+
         for q_tile in hl.tile(q_tokens):
+            begin_q = q_tile.begin
 
             bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
             q_blk = q_bh[bh_tile, q_tile, :]
@@ -413,14 +299,19 @@ def helion_flash_atten_2_algo_4(
             atten_blk = atten_bh[bh_tile, q_tile, k_tile]
             # q dot k
             qk_blk = torch.bmm(q_blk, k_blk) * qk_scale # batch matrix multiply
-            if causal and q_tile.begin < k_tile.end - 1:
 
-                mask_blk = torch.triu(
-                    torch.full([q_tile, k_tile], 1.0, dtype=torch.bool), 
-                    diagonal=q_tile.begin - k_tile.begin + 1
-                    ).to(q_bh.device)
+            if causal and begin_q < end_k - 1:
 
-                qk_blk.masked_fill_(mask_blk, float("-inf"))
+                q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
+                k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
+                mask_tile = q_range_t[:, None] - k_range_t[None, :] + 1
+
+                inf_t = torch.tensor(float("inf"), dtype=torch.float32, device=cuda_device) 
+                qk_blk = torch.where(
+                    mask_tile > 0,
+                    qk_blk,
+                    inf_t
+                )
 
             exp_qk_blk = torch.exp2(qk_blk) * bwd_normalizing_const_tile 
             # exp_qk.shape = [bh, q, k]
@@ -462,6 +353,7 @@ def helion_flash_atten_2_algo_4(
     return dq_bh.view([batch, head, q_tokens, head_dim]), \
         dk_bh.view([batch, head, k_tokens, head_dim]), \
         dv_bh.view([batch, head, v_tokens, head_dim])
+
 
 helion.kernel(
     static_shapes=True
