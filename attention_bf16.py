@@ -9,7 +9,6 @@ from typing import cast
 
 from helion._testing import DEVICE
 from helion._testing import run_example
-
 from torch.autograd import Function
 HELION_INTERPRET=1
 
@@ -256,8 +255,13 @@ def helion_atten_bf16_fwd_training(
         # load q
         q_blk_fp16 = q_bh_fp16[bh_tile, q_tile, :]
 
+        begin_q = q_tile.begin
+        end_q = q_tile.end
+
         for k_tile in hl.tile(k_tokens):
             # load k
+            begin_k = k_tile.begin
+            end_k = k_tile.end
             k_blk_fp16 = k_bh_fp16[bh_tile, :, k_tile]
             
             # q dot k
@@ -269,14 +273,18 @@ def helion_atten_bf16_fwd_training(
             # fp16 inputs will still accumulate in fp32
             # qk_tile.shape = [bh_idx_list, q_idx_list, k_idx_list]
 
-            # if causal and begin_q < end_k - 1:
+            if causal and begin_q < end_k - 1:
 
-            #     mask_blk = torch.triu(
-            #         torch.full([q_tile, k_tile], 1.0, dtype=torch.bool, device=cuda_device), 
-            #         diagonal=begin_q - begin_k + 1
-            #         )
+                q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
+                k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
+                mask_tile = q_range_t[:, None] - k_range_t[None, :] + 1
 
-                # qk_blk_bf16.masked_fill_(mask_blk, float("-inf"))
+                bf16_inf_t = torch.tensor(float("inf"), dtype=torch.bfloat16, device=cuda_device) 
+                qk_blk_bf16 = torch.where(
+                    mask_tile > 0,
+                    qk_blk_bf16,
+                    bf16_inf_t
+                )
 
             # recalculate max tile
             qk_max_blk_bf16 = torch.max(qk_max_blk_bf16, torch.amax(qk_blk_bf16, -1, keepdim=True) * qk_scale).to(torch.bfloat16)
@@ -298,10 +306,11 @@ def helion_atten_bf16_fwd_training(
                 BETA * qk_max_blk_bf16, 
                 qk_max_blk_bf16
             )
-
+            bf16_zero_t = torch.tensor(0.0, dtype=torch.bfloat16, device=cuda_device)
             qk_max_blk_bf16 = torch.where(
                 more_than_one_approx_max & (qk_max_blk_bf16 < 0), 
-                0.0*qk_max_blk_bf16, # bug where qk_max_blk_bf16 assign fp32 in loop but init in fp32
+                bf16_zero_t,
+                # 0.0*qk_max_blk_bf16, # bug where qk_max_blk_bf16 assign fp32 in loop but init in fp32
                 qk_max_blk_bf16
             )
 
