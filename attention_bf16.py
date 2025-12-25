@@ -28,6 +28,10 @@ class FlashAttention_2_BF16_autograd_function(Function):
         causal: bool
     ):
         atten_fp32, bwd_normalizing_blk = helion_atten_bf16_fwd_training(q,k,v, causal) 
+
+        # assert torch.isnan(atten_fp32).sum() == 0
+        # assert torch.isnan(bwd_normalizing_blk).sum() == 0
+
         return atten_fp32, bwd_normalizing_blk
 
     @staticmethod
@@ -178,13 +182,13 @@ def helion_atten_bf16_fwd_training(
             # fp16 inputs will still accumulate in fp32
             # qk_tile.shape = [bh_idx_list, q_idx_list, k_idx_list]
 
-            if causal and begin_q < end_k - 1:
+            if causal and begin_q < end_k:
 
                 q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
                 k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
                 mask_tile = q_range_t[:, None] - k_range_t[None, :]
 
-                bf16_inf_t = torch.tensor(float("inf"), dtype=torch.bfloat16, device=cuda_device) 
+                bf16_inf_t = torch.tensor(float("-inf"), dtype=torch.bfloat16, device=cuda_device) 
                 qk_blk_bf16 = torch.where(
                     mask_tile > 0,
                     qk_blk_bf16, # lower triangle
@@ -243,6 +247,8 @@ def helion_atten_bf16_fwd_training(
 
         bwd_normalizing_blk_fp32[bh_tile, q_tile] = qk_max_blk_bf16.squeeze(-1) + torch.log2(exp_qk_sum_blk_fp32).squeeze(-1)
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
+        # usage qk = qk - bwd_normalizing_blk_fp32
+        # exp_qk = torch.exp2(qk)
 
         atten_blk_fp32 = exp_qk_v_blk_fp32/ exp_qk_sum_blk_fp32
         atten_out_fp32[bh_tile, q_tile, :] = atten_blk_fp32 #.to(torch.float32)
@@ -254,7 +260,7 @@ def helion_atten_bf16_fwd_training(
     autotune_effort="none",
     static_shapes=True,
     config=helion.Config(
-        block_sizes=[4, 16, 16] 
+        block_sizes=[2, 16, 16] 
         # block_size=[16, 16, 16] -> not enoughed shared memory for RTX3080
         # x=4, y=16, z=16, if y or z < 16 there is some funny join then permute bug
         
@@ -302,7 +308,6 @@ def helion_flash_atten_2_algo_4(
     atten_bh = atten.reshape([-1, q_tokens, head_dim])
     d_atten_bh = d_atten.reshape([-1, q_tokens, head_dim])
 
-
     sm_scale =  1.0 / math.sqrt(head_dim) 
     qk_scale = sm_scale * 1.44269504 
 
@@ -330,21 +335,20 @@ def helion_flash_atten_2_algo_4(
             # qk_blk = hl.zeros((bh_tile, q_tile, k_tile), device=cuda_device)
             qk_blk = qk_scale * qk_blk
 
-            if causal and begin_q < end_k - 1:
+            if causal and begin_q < end_k:
 
                 q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
                 k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
-                mask_tile = q_range_t[:, None] - k_range_t[None, :]
-
-                inf_t = torch.tensor(float("inf"), dtype=torch.float32, device=cuda_device) 
+                mask_tile = q_range_t[:, None] - k_range_t[None, :] 
+                inf_t = torch.tensor([-128], device=cuda_device) # float32 log2(min_value) = 128
                 qk_blk = torch.where(
-                    mask_tile > 0,
+                    mask_tile> 0,
                     qk_blk,
                     inf_t
                 )
 
             bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
-            exp_qk_blk = torch.exp2(qk_blk) * bwd_normalizing_const_tile[:, :, None] 
+            exp_qk_blk = torch.exp2(qk_blk - bwd_normalizing_const_tile[:, :, None])
             # exp_qk.shape = [bh, q, k]
 
             d_atten_blk = d_atten_bh[bh_tile, q_tile, :]
@@ -389,16 +393,16 @@ def helion_flash_atten_2_algo_4(
             d_softmax_blk_T = qk_scale * d_softmax_blk.transpose(-1, -2)
             dk_blk = torch.baddbmm(
                 dk_blk, 
-                qk_scale*d_softmax_blk_T, 
+                d_softmax_blk_T, 
                 q_blk
             )
-            # dk_tile.shape 
-            # [bh, k, head_dim] = [bh, k, q] @ [bh, q, head]
 
         dk_bh[bh_tile, k_tile, :] = dk_blk
         dv_bh[bh_tile, k_tile, :] = dv_blk
 
-    return dq_bh.view([batch, head, q_tokens, head_dim]), dk_bh.view([batch, head, k_tokens, head_dim]), dv_bh.view([batch, head, v_tokens, head_dim])
+    return dq_bh.view([batch, head, q_tokens, head_dim]), \
+        dk_bh.view([batch, head, k_tokens, head_dim]), \
+        dv_bh.view([batch, head, v_tokens, head_dim])
 
 
 helion.kernel(
@@ -524,11 +528,14 @@ def baseline_pytorch_attention(
     p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
 
     if causal:
-        q_token, k_token = p.shape
-        q_range_t = torch.arange(0, q_token)
-        k_range_t = torch.arange(0, k_token)
+        b, h, q_token, k_token = p.shape
+        q_range_t = torch.arange(0, q_token).to(q.device)
+        k_range_t = torch.arange(0, k_token).to(q.device)
         mask = q_range_t[:, None] - k_range_t[None, :] 
-        p = torch.where(mask > 0, p, float("-inf"))
+        mask = mask[None, None, :, :]
+        p = torch.where(mask > 0, p, 2 ** -128) 
+
+    # p = torch._safe_softmax(p.float(), dim=-1).to(torch.float32)
 
     p = torch.softmax(p.float(), dim=-1).to(torch.float32)
     return torch.matmul(p, v)
@@ -609,11 +616,11 @@ def test_forward_bf16(
     k_fp16 = k.to(torch.float16)
     v_bf16 = v.to(torch.bfloat16)
 
-    helion_fp32_t = helion_atten_bf16_fwd_training(q_fp16, k_fp16, v_bf16, causal=False)
+    helion_fp32_t, _ = helion_atten_bf16_fwd_training(q_fp16, k_fp16, v_bf16, causal=False)
     pytorch_t = baseline_pytorch_attention(q, k, v, head_dim=head_dim, causal=False,)
     mse_diff = torch.nn.functional.mse_loss(pytorch_t, helion_fp32_t)
     print(mse_diff)
-    # torch.testing.assert_close(pytorch_t, helion_fp32_t, atol=1e-2, rtol=0)
+    # torch.testing.assert_close(pytorch_t, helion_fp32_t, atol=1e-1, rtol=0)
 
 def test_backward():
 
@@ -623,6 +630,7 @@ def test_backward():
     head_dim = 64
     dtype = torch.float32
     device = "cuda"
+    causal = True
 
     q, k, v = [
         torch.randn(
@@ -652,15 +660,22 @@ def test_backward():
         q_fp16, 
         k_fp16, 
         v_bf16, 
-        causal=False
+        causal=causal
     )
-    pytorch_t = baseline_pytorch_attention(q, k, v, head_dim=head_dim, causal=False)
+    pytorch_t = baseline_pytorch_attention(q, k, v, head_dim=head_dim, causal=causal)
 
     helion_mse_diff = mse_loss(helion_bf16_t, ground_truth)
     pytorch_mse_diff = mse_loss(pytorch_t, ground_truth)
 
     helion_mse_diff.backward()
     pytorch_mse_diff.backward()
+
+    # torch.testing.assert_close(
+    #     helion_bf16_t.to(torch.float32),
+    #     pytorch_t,
+    #     atol=1e-2,
+    #     rtol=0
+    # )
 
     torch.testing.assert_close(
         q.grad, 
