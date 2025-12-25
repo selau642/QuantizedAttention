@@ -254,7 +254,10 @@ def helion_atten_bf16_fwd_training(
     autotune_effort="none",
     static_shapes=True,
     config=helion.Config(
-        block_sizes=[4, 16, 16] # x=4, y=16, z=16, if y or z < 16 there is some funny join then permute bug
+        block_sizes=[4, 16, 16] 
+        # block_size=[16, 16, 16] -> not enoughed shared memory for RTX3080
+        # x=4, y=16, z=16, if y or z < 16 there is some funny join then permute bug
+        
     )
 )
 def helion_flash_atten_2_algo_4(
@@ -317,25 +320,28 @@ def helion_flash_atten_2_algo_4(
 
         dk_blk = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float32)
         dv_blk = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float32)
+        begin_k = k_tile.begin
+        end_k = k_tile.end
 
         for q_tile in hl.tile(q_tokens):
+            begin_q = q_tile.begin
             q_blk = q_bh[bh_tile, q_tile, :]
             qk_blk = torch.bmm(q_blk, k_blk)  # batch matrix multiply
             # qk_blk = hl.zeros((bh_tile, q_tile, k_tile), device=cuda_device)
             qk_blk = qk_scale * qk_blk
 
-            # if causal and begin_q < end_k - 1:
+            if causal and begin_q < end_k - 1:
 
-            #     q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
-            #     k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
-            #     mask_tile = q_range_t[:, None] - k_range_t[None, :]
+                q_range_t = torch.arange(0, q_tile.block_size, device=cuda_device) + begin_q
+                k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
+                mask_tile = q_range_t[:, None] - k_range_t[None, :]
 
-            #     inf_t = torch.tensor(float("inf"), dtype=torch.float32, device=cuda_device) 
-            #     qk_blk = torch.where(
-            #         mask_tile > 0,
-            #         qk_blk,
-            #         inf_t
-            #     )
+                inf_t = torch.tensor(float("inf"), dtype=torch.float32, device=cuda_device) 
+                qk_blk = torch.where(
+                    mask_tile > 0,
+                    qk_blk,
+                    inf_t
+                )
 
             bwd_normalizing_const_tile = bwd_normalizing_const[bh_tile, q_tile]
             exp_qk_blk = torch.exp2(qk_blk) * bwd_normalizing_const_tile[:, :, None] 
