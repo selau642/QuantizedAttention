@@ -223,7 +223,7 @@ def helion_atten_bf16_fwd_training(
                 k_range_t = torch.arange(0, k_tile.block_size, device=cuda_device) + begin_k
                 mask_tile = q_range_t[:, None] - k_range_t[None, :]
 
-                bf16_inf_t = torch.tensor(float("-inf"), dtype=torch.bfloat16, device=cuda_device) 
+                bf16_inf_t = torch.tensor([-126], dtype=torch.bfloat16, device=cuda_device) 
                 S_bf16 = torch.where(
                     mask_tile > 0,
                     S_bf16, # lower triangle
@@ -673,7 +673,7 @@ def test_backward():
     head_dim = 64
     dtype = torch.float32
     device = "cuda"
-    causal = False 
+    causal = True
 
     q, k, v = [
         torch.randn(
@@ -720,6 +720,7 @@ def test_backward():
     #     rtol=0
     # )
 
+    # q_fp16.grad 1507 of 18350080 not close
     torch.testing.assert_close(
         q.grad, 
         q_fp16.grad.to(torch.float32),
@@ -734,6 +735,7 @@ def test_backward():
         rtol=0
     )
 
+    # v_fp16 grad 2080 of 18350080 not close
     torch.testing.assert_close(
         v.grad, 
         v_bf16.grad.to(torch.float32),
@@ -777,5 +779,5 @@ if __name__ == "__main__":
 
     """
 
-    # test_forward_bf16(8, 35, 1024, 64, torch.float32, device=DEVICE)
+    test_forward_bf16(8, 35, 1024, 64, torch.float32, device=DEVICE)
     test_backward()
