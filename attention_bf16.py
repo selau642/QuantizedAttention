@@ -65,12 +65,14 @@ class FlashAttention_2_BF16_autograd_function(Function):
         """
 
         Backward in standard fp32
+        carry over O_fp32 and lse_fp32
+        S = qk multiplication also in fp32
 
         """
 
         q_fp16, k_fp16, v_bf16, O_fp32, lse_fp32 = ctx.saved_tensors
         causal = ctx.args
-        dq_fp32, dk_fp32, dv_fp32 = helion_flash_atten_2_algo_4(
+        dq_fp32, dk_fp32, dv_fp32 = helion_flash_atten_2_algo_4_bwd(
             q_fp16,
             k_fp16,
             v_bf16,   
@@ -304,7 +306,7 @@ def helion_atten_bf16_fwd_training(
         
     )
 )
-def helion_flash_atten_2_algo_4(
+def helion_flash_atten_2_algo_4_bwd(
     q_input: torch.Tensor,
     k_input: torch.Tensor,
     v_input: torch.Tensor,   
