@@ -26,7 +26,7 @@ class SageAttention3_Int8_autograd_function(Function):
         sq_bh, sk_bh, sv_bh, \
         Bq, Bkv = helion_atten_int8_linked_fwd(
             q_fp16,
-            k_fp16,
+            k_fp16_minus_mean,
             v_fp16
         )
 
@@ -121,7 +121,7 @@ def helion_atten_int8_linked_fwd(
     Bkv = helion.next_power_of_2(helion.cdiv(k_tokens, split_kv))
 
     sk_bh = torch.zeros((batch*head, split_kv), device=cuda_device)
-    k_int8_bh = torch.zeros((batch*head, k_tokens, k_head_dim))
+    k_int8_bh_T = torch.zeros((batch*head, k_head_dim, k_tokens))
 
     sv_bh = torch.zeros((batch*head, split_kv), device=cuda_device)
     v_int8_bh = torch.zeros((batch*head, v_tokens, v_head_dim))
@@ -150,7 +150,7 @@ def helion_atten_int8_linked_fwd(
 
             k_int8 = k / sk
             k_int8 = k_int8.to(torch.int8)
-            k_int8_bh[bh_tile, k_tile, :] = k_int8
+            k_int8_bh_T[bh_tile, :, k_tile] = k_int8
 
             S = torch.bmm(q_int8, k_int8) * sq * sk * qk_scale             
 
@@ -200,7 +200,7 @@ def helion_atten_int8_linked_fwd(
         O_bh[bh_tile, q_tile, :] = O_final
 
     return O_bh.view([batch, head, q_tokens, q_head_dim]), l_bh, \
-        q_int8_bh, k_int8_bh, v_int8_bh, \
+        q_int8_bh, k_int8_bh_T, v_int8_bh, \
         sq_bh, sk_bh, sv_bh, \
         Bq, Bkv
 
@@ -210,14 +210,15 @@ def helion_atten_int8_linked_fwd(
     static_shapes=True
 )
 def helion_atten_int8_linked_bwd(
-    q_int8_bh: torch.Tensor,
+    batch, head,
+    q_bh_int8: torch.Tensor,
     sq_bh: torch.Tensor, 
 
-    k_int8_bh: torch.Tensor,
-    k_mean_input: torch.Tensor,
+    k_bh_int8_T: torch.Tensor,
+    k_mean_bh: torch.Tensor,
     sk_bh: torch.Tensor,
 
-    v_int8_bh: torch.Tensor,
+    v_bh_int8: torch.Tensor,
     sv_bh: torch.Tensor,
 
     O_input: torch.Tensor,
@@ -235,54 +236,43 @@ def helion_atten_int8_linked_bwd(
 
     """
 
-    batch, head, q_tokens, q_head_dim = q_input.shape
-    k_batch, k_head, k_tokens, k_head_dim = k_input.shape
-    k_batch, k_head, k_tokens = k_mean_input.shape
-    v_batch, v_head, v_tokens, v_head_dim = v_input.shape
+    batch_head, q_tokens, q_head_dim = q_bh_int8.shape
+    batch_head, k_head_dim , k_tokens= k_bh_int8_T.shape
+    batch_head, k_tokens = k_mean_bh.shape
+    batch_head, v_tokens, v_head_dim = v_bh_int8.shape
 
     head_dim = q_head_dim
 
-    q_bh = q_input.reshape([-1, q_tokens, head_dim])
-    k_bh = k_input.reshape([-1, k_tokens, head_dim]).transpose(-1, -2)
-    k_mean_bh = k_mean_input.reshape([-1, k_tokens])
-
-    v_bh = v_input.reshape([-1, v_tokens, head_dim])
     O_bh = O_input.reshape([-1, q_tokens, head_dim])
     dO_bh = dO_input.reshape([-1, q_tokens, head_dim])
 
     sm_scale =  1.0 / math.sqrt(head_dim) 
     qk_scale = sm_scale * 1.44269504 
 
-    cuda_device = q_input.device
+    cuda_device = q_bh_int8.device
 
-    dq_bh = torch.zeros_like(q_bh)
-    dk_bh = torch.zeros([batch*head, k_tokens, head_dim], device=cuda_device) # not transposed
-    dv_bh = torch.zeros_like(v_bh)
+    dq_bh = torch.zeros_like(q_bh_int8, dtype=torch.float16)
+    dk_bh = torch.zeros([batch_head, k_tokens, head_dim], 
+                        device=cuda_device, dtype=torch.float16) # not transposed
+    dv_bh = torch.zeros_like(v_bh_int8, dtype=torch.float16)
 
-    for bh_tile, k_tile in hl.tile([batch*head, k_tokens], block_size=[None, Bkv]):
+    for bh_tile, k_tile in hl.tile([batch_head, k_tokens], block_size=[None, Bkv]):
 
-        k = k_bh[bh_tile, :, k_tile]
-        v = v_bh[bh_tile, k_tile, :]
+        k_int8_T = k_bh_int8_T[bh_tile, :, k_tile]
+        v_int8 = v_bh_int8[bh_tile, k_tile, :]
 
         sk = sk_bh[bh_tile, k_tile.id]
-        k_int8 = k / sk 
-        k_int8 = k_int8.to(torch.int8)
-
         sv = sv_bh[bh_tile, k_tile.id]
-        v_int8 = v / sv 
-        v_int8 = v_int8.to(torch.int8)
 
-        dk = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float32)
-        dv = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float32)
+        dk = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float16)
+        dv = hl.zeros((bh_tile, k_tile, head_dim), device=cuda_device, dtype=torch.float16)
 
         for q_tile in hl.tile(q_tokens, block_size=[Bq]):
 
-            q = q_bh[bh_tile, q_tile, :]
+            q_int8 = q_bh_int8[bh_tile, q_tile, :]
             sq = sq_bh[bh_tile, q_tile.id]
-            q_int8 = q / sq
-            q_int8 = q_int8.to(torch.int8)
 
-            S = torch.bmm(q_int8, k_int8) * sq * sv * qk_scale  # batch matrix multiply
+            S = torch.bmm(q_int8, k_int8_T) * sq * sv * qk_scale  # batch matrix multiply
 
             l = lse_input[bh_tile, q_tile]
             P = torch.exp2(S - l[:, :, None])
@@ -300,14 +290,15 @@ def helion_atten_int8_linked_bwd(
             dO_int8 = dO / s_dO
             dO_int8 = dO_int8.to(torch.int8)
 
+            # TODO fix: torch.baddnmm doesn't support int8
             dv = torch.baddbmm(dv, P_int8_T, dO_int8) * sP * s_dO
 
             # dv.shape 
             # [bh, k, head_dim] = [bh, k, q] @ [bh, q, head_dim]
 
 
-            v_T = torch.transpose(v, 1, 2)
-            dP_fp16 = torch.bmm(dO, v_T) 
+            v_int8_T = torch.transpose(v_int8, 1, 2)
+            dP_fp16 = torch.bmm(dO, v_int8_T) * sv 
             # [bh, q, head_dim] @ [bh, head_dim, k]
             # dP.shape = [bh, q, k]
 
@@ -329,8 +320,6 @@ def helion_atten_int8_linked_bwd(
             dS_int8 = dS / s_dS
             dS_int8 = dS_int8.to(torch.int8)
             # [bh, q, k] * [bh, q, k] 
-
-            k_int8_T = k_int8.transpose(-1,-2)
 
             dS_dot_k = torch.bmm(dS_int8, k_int8_T) * qk_scale * s_dS * sk
             k_mean = k_mean_bh[bh_tile, k_tile]
