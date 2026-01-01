@@ -66,6 +66,163 @@ class SageAttention3_Int8_autograd_function(Function):
     autotune_effort="none",
     static_shapes=True
 )
+def helion_atten_int8_hldot_fwd(
+    q_fp16_input: torch.Tensor,
+    k_fp16_input: torch.Tensor,
+    v_fp16_input: torch.Tensor,
+) -> Tuple[
+    torch.Tensor, torch.Tensor,
+    torch.Tensor, torch.Tensor, torch.Tensor,
+    int, int
+    ]:
+ 
+
+    """
+
+
+    Forward tuning determines the block size Bq and Bkv 
+    for backward according to original SageAttention3 paper
+
+    split head_dim into (split_d) dims 
+    to do small tile by tile mma in int8 x int8
+    using hl.dot()
+
+
+    """
+
+    batch, head, q_tokens, q_head_dim = q_fp16_input.shape
+    batch, head, k_tokens, k_head_dim = k_fp16_input.shape
+    batch, head, v_tokens, v_head_dim = v_fp16_input.shape
+
+    assert k_tokens == v_tokens, "k and v tokens are different"
+    assert k_head_dim == v_head_dim, "k head_dim and v head_dim are different"
+
+    q_bh = q_fp16_input.reshape([-1, q_head_dim])
+    k_bh = k_fp16_input.reshape([-1, k_head_dim]).transpose(1, 2)
+    v_bh = v_fp16_input.reshape([-1, v_head_dim])
+
+    cuda_device = q_fp16_input.device
+
+    l_bh = torch.zeros(
+        [batch*head*q_tokens], 
+        dtype=torch.float32, 
+        device=cuda_device
+        )
+    # lse = rowsum p
+
+    O_bh = torch.empty_like(
+        q_bh, 
+        dtype=torch.float32, 
+        device=cuda_device
+        )
+
+    sm_scale = 1.0 / math.sqrt(q_head_dim) 
+
+    qk_scale = sm_scale * 1.44269504 
+
+    split_d = hl.register_tunable("split_d", PowerOfTwoFragment(8, 128, 16))
+    Bd = helion.next_power_of_2(helion.cdiv(q_head_dim, split_d))
+
+    total_q_tokens = batch * head * q_tokens
+    split_q = hl.register_tunable("split_q", PowerOfTwoFragment(8, 256, 16))
+    Bq = helion.next_power_of_2(helion.cdiv(total_q_tokens, split_q))
+
+    sq_bh = torch.zeros((split_q, split_d), device=cuda_device)
+    q_int8_bh = torch.zeros((total_q_tokens, q_head_dim))
+
+    total_kv_tokens = batch * head * k_tokens
+    split_kv = hl.register_tunable("split_kv", PowerOfTwoFragment(8, 256, 16))
+    Bkv = helion.next_power_of_2(helion.cdiv(total_kv_tokens, split_kv))
+
+    sk_bh = torch.zeros((split_kv, split_d), device=cuda_device)
+    k_int8_bh_T = torch.zeros((k_head_dim, total_kv_tokens))
+
+    sv_bh = torch.zeros((split_kv, split_d), device=cuda_device)
+    v_int8_bh = torch.zeros((total_kv_tokens, v_head_dim))
+
+    for q_tile in hl.tile([total_q_tokens], block_size=[Bq]):
+
+        O = hl.zeros([q_tile, q_head_dim])
+        l = hl.zeros([q_tile, q_head_dim])
+        m = hl.full([q_tile, q_head_dim, 1], float("-inf"), dtype=torch.float16)
+
+        for k_tile in hl.tile([total_kv_tokens], block_size=[Bkv]):
+
+            S_int32 = hl.zeros([q_tile, k_tile])
+
+            for d_tile in hl.tile([q_head_dim], block_size=[Bd]):
+
+                q = q_bh[q_tile, d_tile]        
+                sq = torch.max(q.abs()) / 127
+                q_int8 = q / sq
+                q_int8 = q_int8.to(torch.int8)
+
+                sq_bh[q_tile.id, d_tile.id] = sq 
+                q_int8_bh[q_tile, d_tile] = q_int8
+
+                k = k_bh[d_tile, k_tile]        
+
+                sk = torch.max(k.abs()) / 127
+                sk_bh[d_tile.id, k_tile.id] = sk
+
+                k_int8 = k / sk
+                k_int8 = k_int8.to(torch.int8)
+                k_int8_bh_T[d_tile, k_tile] = k_int8
+
+                S_int32[q_tile, k_tile] = hl.dot(q_int8, k_int8) * sq * sk * qk_scale             
+
+            row_sum = torch.amax(S_int32, -1, keepdim=True)
+            next_m = torch.max(
+                m, 
+                row_sum
+            ).to(torch.float16)
+
+            P = torch.exp2(S_int32 - next_m)
+
+            """
+
+            Special sp
+
+            """
+            next_l = torch.sum(P, -1, keepdim=True)
+
+            rescale = torch.exp2(m - next_m)
+            m = next_m
+
+            l = l * rescale + next_l
+
+            O = O* rescale
+
+            sp = torch.exp2(row_sum - m) / 127
+            P_int8 = P / sp
+            P_int8 = P.to(torch.int8)
+
+            for d_tile in hl.tile([q_head_dim], block_size=[Bd]):
+                P_int8_sub_d = P_int8[d_tile]
+                v = v_bh[k_tile, d_tile]
+                sv = torch.max(v.abs()) / 127
+                sv_bh[k_tile.id, d_tile.id] = sv
+                v_int8 = v / sv
+                v_int8 = v_int8.to(torch.int8)
+                v_int8_bh[k_tile, d_tile] = v_int8
+                O[k_tile, d_tile] += hl.dot(P_int8_sub_d, v_int8) * sp * sv
+
+            l_bh[q_tile, :] = m.squeeze(-1) + torch.log2(l).squeeze(-1)
+            # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
+            # usage qk = qk - bwd_normalizing_blk_fp32
+            # exp_qk = torch.exp2(qk)
+
+            O_final = O / l
+            O_bh[q_tile, :] = O_final
+
+    return O_bh.view([batch, head, q_tokens, q_head_dim]), l_bh, \
+        q_int8_bh, k_int8_bh_T, v_int8_bh, \
+        sq_bh, sk_bh, sv_bh, \
+        Bq, Bkv
+@helion.kernel(
+    autotune_effort="none",
+    static_shapes=True
+)
 def helion_atten_int8_linked_fwd(
     q_fp16_input: torch.Tensor,
     k_fp16_input: torch.Tensor,
@@ -151,7 +308,7 @@ def helion_atten_int8_linked_fwd(
             k_int8 = k / sk
             k_int8 = k_int8.to(torch.int8)
             k_int8_bh_T[bh_tile, :, k_tile] = k_int8
-
+            # TODO replace bmm with hl.dot int8 x int8 -> int32
             S = torch.bmm(q_int8, k_int8) * sq * sk * qk_scale             
 
             row_sum = torch.amax(S, -1, keepdim=True)
