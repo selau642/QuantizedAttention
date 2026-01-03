@@ -18,13 +18,14 @@ from torch.nn.functional import mse_loss
 
 class SageAttention3_Int8_autograd_function(Function):
     @staticmethod
-    def foward(q_fp16, k_fp16, v_fp16):
+    def forward(q_fp16, k_fp16, v_fp16):
         k_mean = k_fp16.mean(-1)
-        k_fp16_minus_mean = k_fp16 - k_mean # k-smoothing
+        k_fp16_minus_mean = k_fp16 - k_mean[:, :, :, None] # k-smoothing
 
         O, l_bh, \
+        q_bh_int8, k_bh_int8, v_bh_int8, \
         sq_bh, sk_bh, sv_bh, \
-        Bq, Bkv = helion_atten_int8_linked_fwd(
+        Bq, Bkv, Bd = helion_atten_int8_hl_dot_fwd(
             q_fp16,
             k_fp16_minus_mean,
             v_fp16
@@ -32,34 +33,60 @@ class SageAttention3_Int8_autograd_function(Function):
 
         return O, l_bh, \
             k_mean, \
+            q_bh_int8, k_bh_int8, v_bh_int8, \
             sq_bh, sk_bh, sv_bh, \
-            Bq, Bkv 
+            Bq, Bkv, Bd 
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         q_fp16, k_fp16, v_fp16 = inputs
-        O, l_bh, k_mean, sq_bh, sk_bh, sv_bh, Bq, Bkv = output
+
+        O_fp16, l_bh, \
+        k_mean, \
+        q_bh_int8, k_bh_int8, v_bh_int8, \
+        sq_bh, sk_bh, sv_bh, \
+        Bq, Bkv, Bd = output
 
         ctx.mark_non_differentiable(l_bh, k_mean, sq_bh, sk_bh, sv_bh)
-        ctx.save_for_backward(q_fp16, k_fp16, v_fp16, O, l_bh, k_mean, sq_bh, sk_bh, sv_bh)
-        ctx.args = (Bq, Bkv)
+        ctx.save_for_backward(
+            O_fp16, l_bh,
+            k_mean,
+
+            q_bh_int8, k_bh_int8, v_bh_int8, 
+            sq_bh, sk_bh, sv_bh
+            )
+        ctx.args = (Bq, Bkv, Bd)
 
 
     @staticmethod
-    def backward(ctx, dO, _lse, _sq, _sk, _sv, _Bq, _Bkv):
+    def backward(ctx, 
+        dO, _lse, 
+        _k_mean, 
+        _q_bh_int8, _k_bh_int8, _v_bh_int8,
+        _sq, _sk, _sv, 
+        _Bq, _Bkv, _Bd):
 
-        q_fp16, k_fp16, v_fp16, \
-        O, l_bh, k_mean, sq_bh, sk_bh, sv_bh = ctx.saved_tensors
-        Bq, Bkv = ctx.args
+        O_fp16, l_bh, \
+        k_mean, \
+        q_bh_int8, k_bh_int8, v_bh_int8, \
+        sq_bh, sk_bh, sv_bh = ctx.saved_tensors
 
-        dq, dk, dv = helion_atten_int8_linked_bwd(
-            q_fp16, sq_bh,
-            k_fp16, k_mean, sk_bh,
-            v_fp16, sv_bh,
-            O,
+        Bq, Bkv, Bd = ctx.args
+
+        dq, dk, dv = helion_atten_int8_hl_dot_bwd(
+
+            q_bh_int8, sq_bh,
+            k_bh_int8, k_mean, sk_bh,
+            v_bh_int8, sv_bh,
+
+            O_fp16,
             l_bh,
-            Bq, Bkv
+
+            Bq, Bkv, Bd,
+
+            dO
         )
+
         return dq, dk, dv
 
 @helion.kernel(
@@ -222,14 +249,13 @@ def helion_atten_int8_hl_dot_fwd(
     return O_bh_fp16.view([batch, head, q_tokens, q_head_dim]), l_bh_fp16, \
         q_int8_bh, k_int8_bh_T, v_int8_bh, \
         sq_bh, sk_bh, sv_bh, \
-        Bq, Bkv
+        Bq, Bkv, Bd
 
 @helion.kernel(
     autotune_effort="none",
     static_shapes=True
 )
 def helion_atten_int8_hl_dot_bwd(
-    batch, head,
     q_bh_int8: torch.Tensor,
     sq_bh: torch.Tensor, 
 
@@ -416,7 +442,7 @@ def helion_atten_int8_hl_dot_bwd(
             dS_int8_T = dS_int8.transpose(-1, -2)
             for d_tile in hl.tile([head_dim], block_size=[Bd]):
                 q_int8_sub_d = q_int8[q_tile, d_tile]
-                sq = sq_bh[q_tile, d_tile]
+                sq = sq_bh[q_tile.id, d_tile.id]
                 dk[:, d_tile] = hl.dot(dS_int8_T, q_int8_sub_d)  * s_dS * sq * qk_scale
 
             dk_bh[k_tile, :] = dk
@@ -1038,15 +1064,14 @@ def test_forward_and_backward():
             device=device, 
     )
 
-    helion_sage_atten_t = sage_attention_3_int8(
+    helion_sage_atten_fp16_t = sage_attention_3_int8(
         q_fp16, 
         k_fp16, 
         v_bf16, 
-        causal=causal
     )
     pytorch_t = baseline_pytorch_attention(q, k, v, head_dim=head_dim, causal=causal)
 
-    helion_mse_diff = mse_loss(helion_bf16_t, ground_truth)
+    helion_mse_diff = mse_loss(helion_sage_atten_fp16_t, ground_truth)
     pytorch_mse_diff = mse_loss(pytorch_t, ground_truth)
 
     helion_mse_diff.backward()
@@ -1054,18 +1079,18 @@ def test_forward_and_backward():
 
     abs_tol = 1e-2
     forward_close_bool_t = torch.isclose(
-        helion_bf16_t.to(torch.float32),
+        helion_sage_atten_fp16_t.to(torch.float32),
         pytorch_t,
         atol=abs_tol,
         rtol=0
     )
 
     correct = torch.sum(forward_close_bool_t)
-    total = helion_bf16_t.numel()
+    total = helion_sage_atten_fp16_t.numel()
     error = total - correct
-    mse_error = mse_loss(helion_bf16_t.to(torch.float32), pytorch_t)
+    mse_error = mse_loss(helion_sage_atten_fp16_t.to(torch.float32), pytorch_t)
 
-    print("Helion Bf16 Forward Output: ")
+    print("Helion Sage Attention Int8 Forward Output: ")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
     print("total elemetns: ", total)
@@ -1075,7 +1100,7 @@ def test_forward_and_backward():
     print("------------------------------")
     print("")
 
-    print("Helion fp32 Backward Output: ")
+    print("Helion Sage Attention Int8 Backward Output: ")
     
     backward_close_bool_t = torch.isclose(
         q_fp16.grad.to(torch.float32),
@@ -1166,7 +1191,8 @@ def test_forward_and_backward():
     #     rtol=0
     # )
 
-
+if __name__ == "__main__":
+    test_forward_and_backward()
 
     
 
