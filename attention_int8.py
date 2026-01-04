@@ -91,7 +91,7 @@ class SageAttention3_Int8_autograd_function(Function):
 
 @helion.kernel(
     autotune_effort="none",
-    static_shapes=True
+    static_shapes=True,
 )
 def helion_atten_int8_hl_dot_flat_fwd(
     q_fp16_input: torch.Tensor,
@@ -126,7 +126,8 @@ def helion_atten_int8_hl_dot_flat_fwd(
 
     cuda_device = q_fp16_input.device
     total_q_tokens = batch * head * q_tokens
-
+    total_kv_tokens = batch * head * k_tokens
+    
     l_bh_fp16 = torch.zeros(
         [total_q_tokens], 
         dtype=torch.float16, 
@@ -134,7 +135,7 @@ def helion_atten_int8_hl_dot_flat_fwd(
         )
 
     # lse = rowsum p
-
+    
     O_bh_fp16 = torch.empty_like(
         v_bh, 
         dtype=torch.float16, 
@@ -150,7 +151,6 @@ def helion_atten_int8_hl_dot_flat_fwd(
     sq_bh = torch.zeros((split_q), device=cuda_device)
 
     q_int8_bh = torch.zeros((total_q_tokens, q_head_dim), device=cuda_device)
-    total_kv_tokens = batch * head * k_tokens
 
     Bkv = hl.register_tunable("Bkv", PowerOfTwoFragment(32, 256, 32))
     split_kv = helion.cdiv(total_kv_tokens, Bkv)
@@ -161,16 +161,47 @@ def helion_atten_int8_hl_dot_flat_fwd(
     sv_bh = torch.zeros((split_kv), device=cuda_device)
     v_int8_bh = torch.zeros((total_kv_tokens, v_head_dim), device=cuda_device)
 
+    needle = torch.zeros(
+        (1), 
+        device=cuda_device
+        )
+
+    catch_q_dot_k = torch.zeros(
+        (Bq, Bkv),
+        device=cuda_device
+    )
+    
+    catch_sq = torch.zeros(
+        (1),
+        device=cuda_device
+    )
+    catch_sk = torch.zeros(
+        (1),
+        device=cuda_device
+    )
+
+    catch_S = torch.zeros(
+        (Bq, Bkv),
+        device=cuda_device
+    )
+    catch_next_m = torch.zeros(
+        (Bq, 1),
+        device=cuda_device
+    )
+
+    catch_row_max_S = torch.zeros(
+        (Bq, 1),
+        device=cuda_device
+    )
+
 
     for q_tile in hl.tile(total_q_tokens, block_size=Bq):
 
-        O_fp16 = hl.zeros((q_tile, v_head_dim), dtype=torch.float16, device=cuda_device)
-        l_fp16 = hl.zeros((q_tile, 1), dtype=torch.float16, device=cuda_device)
+        O_fp32 = hl.zeros((q_tile, v_head_dim), dtype=torch.float32, device=cuda_device)
+        l_fp32 = hl.full((q_tile, 1), 1.0, dtype=torch.float32, device=cuda_device)
         m_fp16 = hl.full((q_tile, 1), float("-inf"), dtype=torch.float16, device=cuda_device)
 
         for k_tile in hl.tile(total_kv_tokens, block_size=Bkv):
-
-            S_fp16 = hl.zeros((q_tile, k_tile), dtype=torch.float16, device=cuda_device)
 
             q = q_bh[q_tile,:]        
 
@@ -187,41 +218,46 @@ def helion_atten_int8_hl_dot_flat_fwd(
 
             max_k_tokens = torch.amax(k.abs(), dim=0, keepdim=False) 
             sk = torch.amax(max_k_tokens, dim=0, keepdim=False) / 127
-
             sk_bh[k_tile.id] = sk
 
             k_int8 = k / sk
             k_int8 = k_int8.to(torch.int8)
             k_int8_bh_T[:, k_tile] = k_int8
+            q_dot_k = hl.dot(q_int8, k_int8).to(torch.float32) * sq * sk * qk_scale
+            S_fp16 = q_dot_k.to(torch.float16)
 
-            q_dot_k = hl.dot(q_int8, k_int8)
-            q_dot_k_fp16 = q_dot_k.to(torch.float16) * sq * sk * qk_scale
-            S_fp16 += q_dot_k_fp16           
-
-            # S_fp16 = S_int32.to(torch.float16)
-
-            row_max_S_fp16 = torch.amax(S_fp16, -1, keepdim=True)
+            row_max_S = torch.amax(S_fp16, -1, keepdim=True)
             next_m_fp16 = torch.max(
                 m_fp16, 
-                row_max_S_fp16 
+                row_max_S 
             )
             # next_m_fp16 = [q_tile, 1]
+            c1 = torch.sum(torch.isinf(row_max_S.to(torch.float32)), dim=0)
+            c2 = torch.sum(c1, dim=0)
+            if  c2 > 0:
+                needle[:] = 1
+                catch_q_dot_k[:, :] = q_dot_k
+                catch_sk[:] = sk
+                catch_sq[:] = sq
+                catch_S[:, :] = S_fp16
+                catch_next_m[:, :] = next_m_fp16
+                catch_row_max_S[:, :] = row_max_S
 
-            P_fp16 = torch.exp2(
-                (S_fp16 - next_m_fp16).to(torch.float32)
-            ).to(torch.float16)
+            P_fp32 = torch.exp2(
+                (S_fp16  - next_m_fp16).to(torch.float32)
+            ).to(torch.float32)
 
-            next_l_fp16 = torch.sum(P_fp16, -1, keepdim=True)
+            next_l_fp32 = torch.sum(P_fp32, -1, keepdim=True)
             # next_l_fp16.shape = [q_tile, 1] 
-            rescale_fp16 = torch.exp2(
+            rescale_fp32 = torch.exp2(
                 (m_fp16 - next_m_fp16).to(torch.float32)
-            ).to(torch.float16)
+            ).to(torch.float32)
 
             m_fp16 = next_m_fp16
 
-            l_fp16 = l_fp16 * rescale_fp16 + next_l_fp16
+            l_fp32 = l_fp32 * rescale_fp32  + next_l_fp32
 
-            O_fp16 = O_fp16 * rescale_fp16
+            O_fp32 = O_fp32 * rescale_fp32
 
             """
 
@@ -229,10 +265,10 @@ def helion_atten_int8_hl_dot_flat_fwd(
 
             """
             sp = torch.exp2(
-                (row_max_S_fp16 - m_fp16).to(torch.float32)
+                (row_max_S - m_fp16).to(torch.float32)
                 ) / 127
             # sp.shape = [q_tile, 1]
-            P_int8 = P_fp16 / sp
+            P_int8 = P_fp32 / sp
             P_int8 = P_int8.to(torch.int8)
             # [q_tile, k_tile]
             # O_fp16 = P_int8 @ v_int8
@@ -247,20 +283,22 @@ def helion_atten_int8_hl_dot_flat_fwd(
             v_int8_bh[k_tile, :] = v_int8
 
             P_dot_v_int32 = hl.dot(P_int8, v_int8) * sp * sv
-            O_fp16 += P_dot_v_int32.to(torch.float16)
+            O_fp32 += P_dot_v_int32.to(torch.float32)
 
-        l_bh_fp16[q_tile] = m_fp16.squeeze(-1) + torch.log2(l_fp16.to(torch.float32)).squeeze(-1)
+        l_bh_fp16[q_tile] = m_fp16.squeeze(-1) + torch.log2(l_fp32).squeeze(-1).to(torch.float16)
         # 2 power minus bwd_normalizing_const = (e power minus max_m ) / exp_qk_sum_tile
         # usage qk = qk - bwd_normalizing_blk_fp32
         # exp_qk = torch.exp2(qk)
-
-        O_final = O_fp16 / l_fp16
-        O_bh_fp16[q_tile, :] = O_final
+        O_final = O_fp32 / l_fp32
+        O_bh_fp16[q_tile, :] = O_final.to(torch.float16)
 
     return O_bh_fp16.view([batch, head, q_tokens, q_head_dim]), l_bh_fp16, \
         q_int8_bh, k_int8_bh_T, v_int8_bh, \
         sq_bh, sk_bh, sv_bh, \
-        Bq, Bkv
+        Bq, Bkv, \
+        needle, catch_S, catch_q_dot_k, \
+        catch_next_m, catch_row_max_S, \
+        catch_sq, catch_sk, 
 
 @helion.kernel(
     autotune_effort="none",
@@ -1403,9 +1441,10 @@ def test_forward_int8() -> None:
     k_fp16 = k.to(torch.float16)
     v_bf16 = v.to(torch.float16)
 
-    helion_fp32_t, _ = helion_atten_int8_hl_dot_flat_fwd(q_fp16, k_fp16, v_bf16)
+    out = helion_atten_int8_hl_dot_flat_fwd(q_fp16, k_fp16, v_bf16)
+    helion_fp16_t = out[0]
     pytorch_t = baseline_pytorch_attention(q, k, v, head_dim=head_dim, causal=causal)
-    mse_diff = torch.nn.functional.mse_loss(pytorch_t, helion_fp32_t)
+    mse_diff = torch.nn.functional.mse_loss(pytorch_t, helion_fp16_t.to(torch.float16))
     print(mse_diff)
 
 
