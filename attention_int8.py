@@ -2,7 +2,8 @@
 
 Sage Attention 3 paper
 int8 forward and backward
-for fast fine tuning of transformers on Blackwell
+for fast fine tuning of transformers 
+on Ampere(RTX 30-series), Hopper(RTX 40-series), Blackwell(RTX 50-series)
 
 """
 
