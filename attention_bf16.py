@@ -626,7 +626,7 @@ def test_forward_and_backward():
     print("Helion Bf16 Forward Output: ")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
-    print("total elemetns: ", total)
+    print("total elements: ", total)
     print("mse_error :", mse_error)
 
     print("")
@@ -652,7 +652,7 @@ def test_forward_and_backward():
     print("q.grad:")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
-    print("total elemetns: ", total)
+    print("total elements: ", total)
     print("mse_error :", mse_error)
 
     backward_close_bool_t = torch.isclose(
@@ -672,7 +672,7 @@ def test_forward_and_backward():
     print("k.grad:")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
-    print("total elemetns: ", total)
+    print("total elements: ", total)
     print("mse_error :", mse_error)
 
     backward_close_bool_t = torch.isclose(
@@ -692,7 +692,7 @@ def test_forward_and_backward():
     print("v.grad:")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
-    print("total elemetns: ", total)
+    print("total elements: ", total)
     print("mse_error :", mse_error)
 
     # torch.testing.assert_close(
