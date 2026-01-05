@@ -14,8 +14,7 @@ This kernel provides a way to train and run inference in bfloat16 which corrects
 Users may need to remove the configs to allow Helion to optimize the tiling etc for your specific hardward.  
 
 2. attention_int8.py   
-(Work in Progress)  
-This kernel provides a way to finetune and run inference in Int8 on Blackwell/Hopper using the Sage Attention 3 paper.
+This kernel provides a way to finetune and run inference in Int8 on Tensorcores for Ampere, Hopper and Blackwell using the algo found in the Sage Attention 3 paper.
   
 # INSTALL
 
@@ -44,10 +43,20 @@ this kernels provide more granular control for inputs and outputs to test differ
 
 # Attention in Int8
 
-Sage Attention 3 proposes using dynamic quantization to quantize Q, K, V such that matmul happens in int8 without minimal impact on forward and backward outputs.  
+Sage Attention 3 quantized Q, K, V inputs so that matmul happens in int8 using tensor cores with for forward and backward ops.  
   
 Please refer to paper https://arxiv.org/pdf/2505.11594  
 "SageAttention3: Microscaling FP4 Attention for Inference and An Exploration of 8-bit Training"  
 by Jintao Zhang, Jia Wei, Haoxu Wang etc.  
 
-Currently this is still in development and is not stable.
+# Fine Tuning
+The Helion kernels can be further autotuned by changing the config 
+```
+@helion.kernel(
+    autotune_effort="none",
+    static_shapes=True,
+)
+```
+removing autotune_effort="none" will allow Helion to autotune different shapes and sizes for your GPU and generate a better Triton Kernel.  
+It is advised to autotuned the kernels to obtain the best config for the specific GPU arch.  
+Then use the precompiled Triton Kernel for training/inference.
