@@ -21,7 +21,7 @@ class SageAttention3_Int8_autograd_function(Function):
     @staticmethod
     def forward(q_fp16, k_fp16, v_fp16):
 
-        k_mean_fp16 = k_fp16.mean(-1)
+        k_mean_fp16 = k_fp16.mean(0)
         k_fp16_minus_mean = k_fp16 - k_mean_fp16[:, :, :, None] # k-smoothing
 
         O_fp16, l_bh_fp16, \
