@@ -128,10 +128,10 @@ def helion_attention_jvp_forward_fp32(
 
     for bh_tile, q_tile in hl.tile([batch*head, q_tokens]):
         m_fp32 = hl.full([bh_tile, q_tile, 1], float("-inf"), dtype=torch.float32)
-        l_fp32 = hl.full([bh_tile, q_tile, 1], 1.0, dtype=torch.float32) 
+        l_fp32 = hl.zeros([bh_tile, q_tile, 1], dtype=torch.float32) 
         O_fp32 = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
 
-        r_fp32 = hl.full([bh_tile, q_tile, 1], float("-inf"), dtype=torch.float32)
+        r_fp32 = hl.zeros([bh_tile, q_tile, 1], dtype=torch.float32)
 
         A_fp32 = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
         B_fp32 = hl.zeros([bh_tile, q_tile, head_dim], dtype=torch.float32)
@@ -161,6 +161,7 @@ def helion_attention_jvp_forward_fp32(
 
             rescale = torch.exp2((m_fp32 - next_m_fp32))
             l_fp32 = l_fp32 * rescale + next_l_fp32
+            m_fp32= next_m_fp32
 
             O_fp32 = O_fp32 * rescale
             v_fp32 = v_bh_fp32[bh_tile, k_tile, :]
@@ -185,8 +186,7 @@ def helion_attention_jvp_forward_fp32(
 
         O_final_fp32 = O_fp32 / l_fp32
         O_bh_fp32[bh_tile, q_tile, :] = O_final_fp32 #.to(torch.float32)
-        C_fp32 = r_fp32 * O_final_fp32
-        tO_bh_fp32[bh_tile, q_tile, : ] = (A_fp32 + B_fp32 - C_fp32) / l_fp32
+        tO_bh_fp32[bh_tile, q_tile, : ] = (A_fp32 + B_fp32 - r_fp32 * O_fp32) / l_fp32
 
 
     return O_bh_fp32.view([batch, head, q_tokens, head_dim]), \
@@ -290,7 +290,7 @@ def test_forward_jvp(
     tO_mse_diff = torch.nn.functional.mse_loss(tO_pt, tO_helion_fp32)
 
     print("")
-    print("O_pt:")
+    print("tO_pt:")
     print("at absolute tolerance: ", abs_tol)
     print("elements error: ", error)
     print("total elements: ", total)
