@@ -301,4 +301,17 @@ def test_forward_jvp(
 if __name__ == "__main__":
     test_forward_jvp(
         8, 35, 1024, 64, torch.float32, device=DEVICE
-    )
+    ) 
+    """
+    O_pt:
+    at absolute tolerance:  0.01
+    elements error:  tensor(0, device='cuda:0')
+    total elements:  18350080
+    mse_error : tensor(6.6253e-09, device='cuda:0')
+
+    tO_pt:
+    at absolute tolerance:  0.01
+    elements error:  tensor(0, device='cuda:0')
+    total elements:  18350080
+    mse_error : tensor(1.2681e-07, device='cuda:0')
+    """
