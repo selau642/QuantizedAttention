@@ -15,7 +15,12 @@ Users may need to remove the configs to allow Helion to optimize the tiling etc 
 
 2. attention_int8.py   
 This kernel provides a way to finetune and run inference in Int8 on Tensorcores for Ampere, Hopper and Blackwell using the algo found in the Sage Attention 3 paper.
-  
+
+3. attention_jvp.py
+Sometimes users may use forward mode auto-differentiation for attention especially in Diffusion models that uses Flow Matching.
+This kernel provides an implimentation of attention that outputs Jacobian Vector Products (JVP), for O matrix as tO (tangent O).
+It can be used together with torch forward mode auto-differentiation.
+
 # INSTALL
 
 ```
