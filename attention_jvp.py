@@ -122,7 +122,7 @@ def helion_attention_jvp_forward_fp32(
 
     sm_scale =  1.0 / math.sqrt(head_dim) 
     
-    qk_scale = sm_scale * 1.44269504 * math.log2(head_dim)
+    qk_scale = sm_scale * 1.44269504 
     # 1.44269504 = 1/ln(2), 
     # where ln = log base euler number(2.7182)
 
@@ -148,8 +148,10 @@ def helion_attention_jvp_forward_fp32(
             S_fp32 = torch.bmm(q_fp32, k_fp32_T)
             tan_Q_dot_k_T_fp32 = torch.bmm(tan_q_fp32, k_fp32_T)
             Q_dot_tk_T_fp32 = torch.bmm(q_fp32, tan_k_fp32_T)
-            tS_fp32 = tan_Q_dot_k_T_fp32 + Q_dot_tk_T_fp32
 
+            tS_fp32 = tan_Q_dot_k_T_fp32 + Q_dot_tk_T_fp32
+            tS_fp32 = tS_fp32 * qk_scale
+            
             next_m_fp32 = torch.max(
                 m_fp32, 
                 torch.amax(S_fp32, -1, keepdim=True) * qk_scale
@@ -162,7 +164,6 @@ def helion_attention_jvp_forward_fp32(
             rescale = torch.exp2((m_fp32 - next_m_fp32))
             l_fp32 = l_fp32 * rescale + next_l_fp32
             m_fp32= next_m_fp32
-
             O_fp32 = O_fp32 * rescale
             v_fp32 = v_bh_fp32[bh_tile, k_tile, :]
             tan_v_fp32 = tan_v_bh_fp32[bh_tile, k_tile, :]
@@ -186,7 +187,7 @@ def helion_attention_jvp_forward_fp32(
 
         O_final_fp32 = O_fp32 / l_fp32
         O_bh_fp32[bh_tile, q_tile, :] = O_final_fp32 #.to(torch.float32)
-        tO_bh_fp32[bh_tile, q_tile, : ] = (A_fp32 + B_fp32 - r_fp32 * O_fp32) / l_fp32
+        tO_bh_fp32[bh_tile, q_tile, : ] = (A_fp32 + B_fp32 - r_fp32 * O_final_fp32) / l_fp32
 
 
     return O_bh_fp32.view([batch, head, q_tokens, head_dim]), \
@@ -206,11 +207,11 @@ def baseline_pytorch_attention(
     """
 
     batch, head, tokens, head_dim = q.shape
-    p = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
+    s = torch.matmul(q, k.transpose(2, 3)) / math.sqrt(head_dim)
 
     # p = torch._safe_softmax(p.float(), dim=-1).to(torch.float32)
 
-    p = torch.softmax(p.to(torch.float32), dim=-1).to(torch.float32)
+    p = torch.softmax(s.to(torch.float32), dim=-1).to(torch.float32)
     return torch.matmul(p, v)
 
 def test_forward_jvp(
@@ -249,7 +250,7 @@ def test_forward_jvp(
         tan_q_fp32, tan_k_fp32, tan_v_fp32,
         )
 
-    # pytorch_t = baseline_pytorch_attention( q_fp32, k_fp32, v_fp32)
+    pytorch_t = baseline_pytorch_attention( q_fp32, k_fp32, v_fp32)
     O_pt, tO_pt = jvp(
         baseline_pytorch_attention,
         (q_fp32, k_fp32, v_fp32),
