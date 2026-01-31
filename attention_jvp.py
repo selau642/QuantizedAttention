@@ -150,7 +150,7 @@ def helion_attention_jvp_forward_fp32(
             Q_dot_tk_T_fp32 = torch.bmm(q_fp32, tan_k_fp32_T)
 
             tS_fp32 = tan_Q_dot_k_T_fp32 + Q_dot_tk_T_fp32
-            tS_fp32 = tS_fp32 * qk_scale
+            tS_fp32 = tS_fp32 * sm_scale
             
             next_m_fp32 = torch.max(
                 m_fp32, 
